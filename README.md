@@ -1,135 +1,150 @@
 # mathop-operator
-// TODO(user): Add simple overview of use/purpose
 
-## Description
-// TODO(user): An in-depth paragraph about your project and overview of use
+A Kubernetes operator built with [Kubebuilder](https://book.kubebuilder.io/) that manages two
+chained Custom Resources — `Add` and `Square` — modeled after Crossplane's composition pattern,
+where one resource derives its state from another and stays in sync when that dependency changes.
 
-## Getting Started
+## What it does
 
-### Prerequisites
-- go version v1.24.6+
-- docker version 17.03+.
-- kubectl version v1.11.3+.
-- Access to a Kubernetes v1.11.3+ cluster.
+- **`Add`** takes two integers (`spec.x`, `spec.y`) and computes their sum into `status.result`.
+- **`Square`** references an existing `Add` by name (`spec.addRef.name`), reads its `status.result`,
+  and squares it into its own `status.result`.
+- `Square`'s controller **watches `Add` resources**, not just its own object — so if you edit an
+  `Add`'s numbers after the fact, every `Square` referencing it automatically recomputes, with no
+  action needed on the `Square` itself.
 
-### To Deploy on the cluster
-**Build and push your image to the location specified by `IMG`:**
-
-```sh
-make docker-build docker-push IMG=<some-registry>/mathop-operator:tag
+```
+Add (x=6, y=9) --status.result=15--> Square (addRef: that Add) --status.result=225-->
 ```
 
-**NOTE:** This image ought to be published in the personal registry you specified.
-And it is required to have access to pull the image from the working environment.
-Make sure you have the proper permission to the registry if the above commands don’t work.
+Edit the `Add` to `x=20, y=30` and, without touching `Square` at all, its result updates to `2500`.
 
-**Install the CRDs into the cluster:**
+## Why this matters
 
-```sh
-make install
+Most introductory operator tutorials only recompute a dependent resource when *that resource
+itself* changes. That breaks the moment its upstream dependency changes. This project implements
+the pattern Crossplane relies on for composition: a controller that watches an *upstream* resource
+type and re-triggers reconciliation of every *downstream* resource that depends on it, using a
+field indexer so the lookup stays efficient regardless of cluster size.
+
+## Architecture
+
+```
+api/v1alpha1/
+  add_types.go          Add CRD schema: spec.x, spec.y, status.result, status.conditions
+  square_types.go       Square CRD schema: spec.addRef.name, status.result, status.conditions
+  groupversion_info.go  Registers the math.example.com/v1alpha1 API group
+
+internal/controller/
+  add_controller.go     AddReconciler — computes x + y
+  square_controller.go  SquareReconciler — computes result², watches Add, chains via a field indexer
 ```
 
-**Deploy the Manager to the cluster with the image specified by `IMG`:**
+### The chaining mechanism
 
-```sh
-make deploy IMG=<some-registry>/mathop-operator:tag
+`SquareReconciler.SetupWithManager` does three things:
+
+1. Registers a **field indexer** on `Square.spec.addRef.name`, so "which Squares reference this
+   Add" is an indexed lookup, not a full scan.
+2. `.For(&Square{})` — reconcile whenever a `Square` itself changes.
+3. `.Watches(&Add{}, handler.EnqueueRequestsFromMapFunc(r.findSquaresForAdd))` — also reconcile
+   every `Square` that references an `Add` whenever *that Add* changes.
+
+`findSquaresForAdd` is the mapping function: given a changed `Add`, it uses the field index to
+find every `Square` pointing at it and returns a reconcile request for each.
+
+### Status and conditions
+
+Both types report a `Ready` condition (`metav1.Condition`) alongside their numeric result, with
+reasons like `Computed`, `AddNotFound`, and `WaitingOnAdd` — so `kubectl describe` gives a clear,
+human-readable explanation of state, not just a raw number.
+
+## Prerequisites
+
+- Go 1.21+
+- Docker
+- kubectl
+- [kind](https://kind.sigs.k8s.io/)
+- [kubebuilder](https://book.kubebuilder.io/quick-start.html)
+
+## Getting started
+
+```bash
+kind create cluster --name mathop
+
+make manifests generate   # regenerate CRDs/RBAC/deepcopy after any type changes
+make install               # install the CRDs into the cluster
+make run                   # run the controller locally, logs to stdout
 ```
 
-> **NOTE**: If you encounter RBAC errors, you may need to grant yourself cluster-admin
-privileges or be logged in as admin.
+In another terminal:
 
-**Create instances of your solution**
-You can apply the samples (examples) from the config/sample:
+```bash
+cat <<'EOF' | kubectl apply -f -
+apiVersion: math.example.com/v1alpha1
+kind: Add
+metadata:
+  name: demo-add
+spec:
+  x: 6
+  "y": 9
+EOF
 
-```sh
-kubectl apply -k config/samples/
+cat <<'EOF' | kubectl apply -f -
+apiVersion: math.example.com/v1alpha1
+kind: Square
+metadata:
+  name: demo-square
+spec:
+  addRef:
+    name: demo-add
+EOF
+
+kubectl get add demo-add        # RESULT should show 15
+kubectl get square demo-square  # RESULT should show 225
 ```
 
->**NOTE**: Ensure that the samples has default values to test it out.
+> **Note:** in YAML, a bare `y:` key is parsed as the boolean `true` (YAML 1.1 quirk) — always
+> quote it as `"y":` when writing `Add` manifests.
 
-### To Uninstall
-**Delete the instances (CRs) from the cluster:**
+Prove the chaining works by editing only the `Add`:
 
-```sh
-kubectl delete -k config/samples/
+```bash
+kubectl patch add demo-add --type=merge -p '{"spec":{"x":20,"y":30}}'
+kubectl get square demo-square   # RESULT updates to 2500, without touching Square at all
 ```
 
-**Delete the APIs(CRDs) from the cluster:**
+## Running the automated test suite
 
-```sh
-make uninstall
+```bash
+make test
 ```
 
-**UnDeploy the controller from the cluster:**
+This spins up a real (lightweight) control plane via `envtest` and verifies both the initial
+computation and the chained recomputation after an `Add` update.
 
-```sh
-make undeploy
+## Deploying in-cluster (instead of `make run` on your machine)
+
+```bash
+make docker-build IMG=mathop-operator:v0.1.0
+kind load docker-image mathop-operator:v0.1.0 --name mathop
+make deploy IMG=mathop-operator:v0.1.0
 ```
 
-## Project Distribution
-
-Following the options to release and provide this solution to the users.
-
-### By providing a bundle with all YAML files
-
-1. Build the installer for the image built and published in the registry:
-
-```sh
-make build-installer IMG=<some-registry>/mathop-operator:tag
+```bash
+kubectl get pods -n mathop-operator-system
+kubectl logs -n mathop-operator-system deploy/mathop-operator-controller-manager -c manager -f
 ```
 
-**NOTE:** The makefile target mentioned above generates an 'install.yaml'
-file in the dist directory. This file contains all the resources built
-with Kustomize, which are necessary to install this project without its
-dependencies.
+Tear down with `make undeploy && make uninstall`.
 
-2. Using the installer
+## Failure handling
 
-Users can just run 'kubectl apply -f <URL for YAML BUNDLE>' to install
-the project, i.e.:
+- `Square` referencing a nonexistent `Add` → `Ready=False, Reason=AddNotFound`
+- `Square` referencing an `Add` that hasn't computed a result yet → `Ready=False, Reason=WaitingOnAdd`
+  (resolves automatically once the `Add` controller writes its result, via the same watch)
 
-```sh
-kubectl apply -f https://raw.githubusercontent.com/<org>/mathop-operator/<tag or branch>/dist/install.yaml
-```
+## Built with
 
-### By providing a Helm Chart
-
-1. Build the chart using the optional helm plugin
-
-```sh
-kubebuilder edit --plugins=helm/v2-alpha
-```
-
-2. See that a chart was generated under 'dist/chart', and users
-can obtain this solution from there.
-
-**NOTE:** If you change the project, you need to update the Helm Chart
-using the same command above to sync the latest changes. Furthermore,
-if you create webhooks, you need to use the above command with
-the '--force' flag and manually ensure that any custom configuration
-previously added to 'dist/chart/values.yaml' or 'dist/chart/manager/manager.yaml'
-is manually re-applied afterwards.
-
-## Contributing
-// TODO(user): Add detailed information on how you would like others to contribute to this project
-
-**NOTE:** Run `make help` for more information on all potential `make` targets
-
-More information can be found via the [Kubebuilder Documentation](https://book.kubebuilder.io/introduction.html)
-
-## License
-
-Copyright 2026.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-
+Scaffolded with `kubebuilder`, using `sigs.k8s.io/controller-runtime` for the reconciliation loop,
+manager, and watch/indexer machinery.
