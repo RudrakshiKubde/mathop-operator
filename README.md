@@ -123,20 +123,6 @@ make test
 This spins up a real (lightweight) control plane via `envtest` and verifies both the initial
 computation and the chained recomputation after an `Add` update.
 
-## Deploying in-cluster (instead of `make run` on your machine)
-
-```bash
-make docker-build IMG=mathop-operator:v0.1.0
-kind load docker-image mathop-operator:v0.1.0 --name mathop
-make deploy IMG=mathop-operator:v0.1.0
-```
-
-```bash
-kubectl get pods -n mathop-operator-system
-kubectl logs -n mathop-operator-system deploy/mathop-operator-controller-manager -c manager -f
-```
-
-Tear down with `make undeploy && make uninstall`.
 
 ## Failure handling
 
