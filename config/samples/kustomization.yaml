@@ -1,0 +1,5 @@
+## Append samples of your project ##
+resources:
+- math_v1alpha1_add.yaml
+- math_v1alpha1_square.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples

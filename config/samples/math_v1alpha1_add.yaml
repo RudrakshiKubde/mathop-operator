@@ -1,0 +1,9 @@
+apiVersion: math.example.com/v1alpha1
+kind: Add
+metadata:
+  labels:
+    app.kubernetes.io/name: mathop-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: add-sample
+spec:
+  # TODO(user): Add fields here
