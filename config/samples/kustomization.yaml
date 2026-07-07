@@ -2,4 +2,5 @@
 resources:
 - math_v1alpha1_add.yaml
 - math_v1alpha1_square.yaml
+- math_v1alpha1_subtract.yaml
 # +kubebuilder:scaffold:manifestskustomizesamples

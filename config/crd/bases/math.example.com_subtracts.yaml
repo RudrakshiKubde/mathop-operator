@@ -4,33 +4,29 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.21.0
-  name: squares.math.example.com
+  name: subtracts.math.example.com
 spec:
   group: math.example.com
   names:
-    kind: Square
-    listKind: SquareList
-    plural: squares
-    singular: square
+    kind: Subtract
+    listKind: SubtractList
+    plural: subtracts
+    singular: subtract
   scope: Namespaced
   versions:
   - additionalPrinterColumns:
-    - jsonPath: .spec.sourceRef.kind
-      name: SourceKind
-      type: string
-    - jsonPath: .spec.sourceRef.name
-      name: SourceName
-      type: string
+    - jsonPath: .spec.x
+      name: X
+      type: integer
+    - jsonPath: .spec.y
+      name: "Y"
+      type: integer
     - jsonPath: .status.result
       name: Result
       type: integer
-    - jsonPath: .metadata.creationTimestamp
-      name: Age
-      type: date
     name: v1alpha1
     schema:
       openAPIV3Schema:
-        description: Square is the Schema for the squares API
         properties:
           apiVersion:
             description: |-
@@ -50,32 +46,18 @@ spec:
           metadata:
             type: object
           spec:
-            description: SquareSpec defines the desired state of Square
             properties:
-              sourceRef:
-                description: SourceRef references any resource whose status.result
-                  should be squared
-                properties:
-                  apiVersion:
-                    description: APIVersion of the referenced resource, e.g. "math.example.com/v1alpha1"
-                    type: string
-                  kind:
-                    description: Kind of the referenced resource, e.g. "Add" or "Subtract"
-                    type: string
-                  name:
-                    description: Name of the referenced resource, in the same namespace
-                      as this Square
-                    type: string
-                required:
-                - apiVersion
-                - kind
-                - name
-                type: object
+              x:
+                format: int32
+                type: integer
+              "y":
+                format: int32
+                type: integer
             required:
-            - sourceRef
+            - x
+            - "y"
             type: object
           status:
-            description: SquareStatus defines the observed state of Square
             properties:
               conditions:
                 items:

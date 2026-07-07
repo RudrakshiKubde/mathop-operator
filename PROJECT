@@ -27,4 +27,13 @@ resources:
   kind: Square
   path: github.com/RudrakshiKubde/mathop-operator/api/v1alpha1
   version: v1alpha1
+- api:
+    crdVersion: v1
+    namespaced: true
+  controller: true
+  domain: example.com
+  group: math
+  kind: Subtract
+  path: github.com/RudrakshiKubde/mathop-operator/api/v1alpha1
+  version: v1alpha1
 version: "3"

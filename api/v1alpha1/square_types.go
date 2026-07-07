@@ -5,34 +5,42 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
-// AddReference points at the Add resource whose result should be squared
-type AddReference struct {
-	// Name of the Add resource, in the same namespace as this Square
+// SourceReference points at ANY resource that publishes a status.result field.
+// Square has zero compile-time / import-level dependency on what that resource's
+// Go type is — it's resolved purely at runtime via apiVersion + kind.
+type SourceReference struct {
+	// APIVersion of the referenced resource, e.g. "math.example.com/v1alpha1"
+	// +kubebuilder:validation:Required
+	APIVersion string `json:"apiVersion"`
+
+	// Kind of the referenced resource, e.g. "Add" or "Subtract"
+	// +kubebuilder:validation:Required
+	Kind string `json:"kind"`
+
+	// Name of the referenced resource, in the same namespace as this Square
 	// +kubebuilder:validation:Required
 	Name string `json:"name"`
 }
 
 // SquareSpec defines the desired state of Square
 type SquareSpec struct {
-	// AddRef references the Add resource to read the sum from
+	// SourceRef references any resource whose status.result should be squared
 	// +kubebuilder:validation:Required
-	AddRef AddReference `json:"addRef"`
+	SourceRef SourceReference `json:"sourceRef"`
 }
 
 // SquareStatus defines the observed state of Square
 type SquareStatus struct {
-	// Result is (referenced Add's result) squared
 	// +optional
 	Result *int32 `json:"result,omitempty"`
-
-	// Conditions represent the latest available observations
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
-// +kubebuilder:printcolumn:name="AddRef",type=string,JSONPath=`.spec.addRef.name`
+// +kubebuilder:printcolumn:name="SourceKind",type=string,JSONPath=`.spec.sourceRef.kind`
+// +kubebuilder:printcolumn:name="SourceName",type=string,JSONPath=`.spec.sourceRef.name`
 // +kubebuilder:printcolumn:name="Result",type=integer,JSONPath=`.status.result`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 

@@ -1,7 +1,7 @@
 apiVersion: math.example.com/v1alpha1
-kind: Add
+kind: Subtract
 metadata:
-  name: add-sample
+  name: subtract-sample
 spec:
-  x: 3
+  x: 9
   "y": 4

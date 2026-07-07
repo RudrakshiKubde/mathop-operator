@@ -56,7 +56,7 @@ func (r *SquareReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		return ctrl.Result{}, r.Status().Update(ctx, &square)
 	}
 
-	// --- This is the actual transfer, from task_transfer.go's FetchTaskResult, which is generic and reusable for any Task consumer ---
+	// --- This is the actual transfer, now one function call ---
 	sum, found, err := FetchTaskResult(ctx, r.Client, square.Namespace, ref.APIVersion, ref.Kind, ref.Name)
 	if err != nil {
 		meta.SetStatusCondition(&square.Status.Conditions, metav1.Condition{
@@ -92,10 +92,10 @@ func (r *SquareReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 
 	return ctrl.Result{}, nil
 }
-// this is the mapping function that the DynamicWatcher calls to find which Squares reference a given source resource.
+
 func (r *SquareReconciler) findSquaresForSource(ctx context.Context, obj client.Object) []ctrl.Request {
 	gvk := obj.GetObjectKind().GroupVersionKind()
-	indexVal := sourceRefIndexValue(gvk.GroupVersion().String(), gvk.Kind, obj.GetName())
+	indexVal := fmt.Sprintf("%s/%s/%s", gvk.GroupVersion().String(), gvk.Kind, obj.GetName())
 
 	var squares mathv1alpha1.SquareList
 	if err := r.List(ctx, &squares, client.InNamespace(obj.GetNamespace()), client.MatchingFields{sourceRefIndexKey: indexVal}); err != nil {
@@ -108,7 +108,6 @@ func (r *SquareReconciler) findSquaresForSource(ctx context.Context, obj client.
 	return requests
 }
 
-//this is called once during controller setup to register the field indexer and the DynamicWatcher.
 func (r *SquareReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &mathv1alpha1.Square{}, sourceRefIndexKey,
 		func(obj client.Object) []string {
@@ -116,7 +115,7 @@ func (r *SquareReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			if sq.Spec.SourceRef.Name == "" {
 				return nil
 			}
-			return []string{sourceRefIndexValue(sq.Spec.SourceRef.APIVersion, sq.Spec.SourceRef.Kind, sq.Spec.SourceRef.Name)}
+			return []string{fmt.Sprintf("%s/%s/%s", sq.Spec.SourceRef.APIVersion, sq.Spec.SourceRef.Kind, sq.Spec.SourceRef.Name)}
 		}); err != nil {
 		return err
 	}
