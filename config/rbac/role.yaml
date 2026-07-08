@@ -16,7 +16,9 @@ rules:
   - math.example.com
   resources:
   - adds
+  - httptasks
   - squares
+  - subtracts
   verbs:
   - create
   - delete
@@ -29,14 +31,18 @@ rules:
   - math.example.com
   resources:
   - adds/finalizers
+  - httptasks/finalizers
   - squares/finalizers
+  - subtracts/finalizers
   verbs:
   - update
 - apiGroups:
   - math.example.com
   resources:
   - adds/status
+  - httptasks/status
   - squares/status
+  - subtracts/status
   verbs:
   - get
   - patch

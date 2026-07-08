@@ -26,6 +26,8 @@ import (
 // FetchTaskResult fetches any resource by apiVersion+kind+name and reads its
 // status.result field. Returns (value, found, error). found=false means the
 // resource exists but hasn't produced a result yet (not an error condition).
+
+// This function's job: given "some resource, identified only by strings," go read its status.result field
 func FetchTaskResult(ctx context.Context, c client.Client, namespace, apiVersion, kind, name string) (int64, bool, error) {
 	gv, err := schema.ParseGroupVersion(apiVersion)
 	if err != nil {
@@ -89,4 +91,7 @@ func (w *DynamicWatcher) Ensure(gvk schema.GroupVersionKind, mapFunc handler.Map
 
 	w.seen[gvk] = true
 	return nil
+}
+func sourceRefIndexValue(apiVersion, kind, name string) string {
+	return fmt.Sprintf("%s/%s/%s", apiVersion, kind, name)
 }

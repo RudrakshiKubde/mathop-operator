@@ -92,6 +92,7 @@ func (r *SquareReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 
 	return ctrl.Result{}, nil
 }
+
 // this is the mapping function that the DynamicWatcher calls to find which Squares reference a given source resource.
 func (r *SquareReconciler) findSquaresForSource(ctx context.Context, obj client.Object) []ctrl.Request {
 	gvk := obj.GetObjectKind().GroupVersionKind()
@@ -108,7 +109,7 @@ func (r *SquareReconciler) findSquaresForSource(ctx context.Context, obj client.
 	return requests
 }
 
-//this is called once during controller setup to register the field indexer and the DynamicWatcher.
+// this is called once during controller setup to register the field indexer and the DynamicWatcher.
 func (r *SquareReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &mathv1alpha1.Square{}, sourceRefIndexKey,
 		func(obj client.Object) []string {

@@ -4,25 +4,22 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.21.0
-  name: squares.math.example.com
+  name: httptasks.math.example.com
 spec:
   group: math.example.com
   names:
-    kind: Square
-    listKind: SquareList
-    plural: squares
-    singular: square
+    kind: HTTPTask
+    listKind: HTTPTaskList
+    plural: httptasks
+    singular: httptask
   scope: Namespaced
   versions:
   - additionalPrinterColumns:
-    - jsonPath: .spec.sourceRef.kind
-      name: SourceKind
+    - jsonPath: .spec.endpoint
+      name: Endpoint
       type: string
-    - jsonPath: .spec.sourceRef.name
-      name: SourceName
-      type: string
-    - jsonPath: .status.result
-      name: Result
+    - jsonPath: .status.statusCode
+      name: StatusCode
       type: integer
     - jsonPath: .metadata.creationTimestamp
       name: Age
@@ -30,7 +27,6 @@ spec:
     name: v1alpha1
     schema:
       openAPIV3Schema:
-        description: Square is the Schema for the squares API
         properties:
           apiVersion:
             description: |-
@@ -50,28 +46,64 @@ spec:
           metadata:
             type: object
           spec:
-            description: SquareSpec defines the desired state of Square
             properties:
-              sourceRef:
-                description: SourceRef references any resource whose status.result
-                  should be squared
-                properties:
-                  apiVersion:
-                    type: string
-                  kind:
-                    type: string
-                  name:
-                    type: string
-                required:
-                - apiVersion
-                - kind
-                - name
+              endpoint:
+                description: Endpoint is the full URL to call, e.g. "http://localhost:9090/add"
+                type: string
+              headers:
+                additionalProperties:
+                  type: string
                 type: object
+              input:
+                description: |-
+                  Input is the static/base JSON request body. Fields from InputFrom are
+                  merged into a copy of this before the request is sent.
+                type: object
+                x-kubernetes-preserve-unknown-fields: true
+              inputFrom:
+                description: |-
+                  InputFrom maps fields from other HTTPTasks' outputs into this Task's
+                  request body. A Task with no InputFrom entries is a "root" task.
+                items:
+                  description: |-
+                    FieldMapping pulls one field out of another Task's output JSON and places
+                    it into this Task's request body before the HTTP call is made.
+                  properties:
+                    sourceField:
+                      description: SourceField is a dot-path into the source Task's
+                        status.output, e.g. "sum" or "data.result"
+                      type: string
+                    sourceRef:
+                      description: SourceReference points at another HTTPTask by name.
+                      properties:
+                        apiVersion:
+                          type: string
+                        kind:
+                          type: string
+                        name:
+                          type: string
+                      required:
+                      - apiVersion
+                      - kind
+                      - name
+                      type: object
+                    targetField:
+                      description: TargetField is a dot-path into THIS task's request
+                        body, e.g. "value" or "a.b"
+                      type: string
+                  required:
+                  - sourceField
+                  - sourceRef
+                  - targetField
+                  type: object
+                type: array
+              method:
+                description: Method defaults to POST if empty
+                type: string
             required:
-            - sourceRef
+            - endpoint
             type: object
           status:
-            description: SquareStatus defines the observed state of Square
             properties:
               conditions:
                 items:
@@ -129,7 +161,17 @@ spec:
                   - type
                   type: object
                 type: array
-              result:
+              observedInputHash:
+                description: |-
+                  ObservedInputHash records a hash of the last request body actually
+                  sent, so we don't re-call the endpoint when nothing has changed.
+                type: string
+              output:
+                description: Output is the raw JSON response body from the HTTP call
+                type: object
+                x-kubernetes-preserve-unknown-fields: true
+              statusCode:
+                description: StatusCode of the HTTP response
                 format: int32
                 type: integer
             type: object

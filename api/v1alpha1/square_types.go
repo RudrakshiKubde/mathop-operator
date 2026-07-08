@@ -8,19 +8,6 @@ import (
 // SourceReference points at ANY resource that publishes a status.result field.
 // Square has zero compile-time / import-level dependency on what that resource's
 // Go type is — it's resolved purely at runtime via apiVersion + kind.
-type SourceReference struct {
-	// APIVersion of the referenced resource, e.g. "math.example.com/v1alpha1"
-	// +kubebuilder:validation:Required
-	APIVersion string `json:"apiVersion"`
-
-	// Kind of the referenced resource, e.g. "Add" or "Subtract"
-	// +kubebuilder:validation:Required
-	Kind string `json:"kind"`
-
-	// Name of the referenced resource, in the same namespace as this Square
-	// +kubebuilder:validation:Required
-	Name string `json:"name"`
-}
 
 // SquareSpec defines the desired state of Square
 type SquareSpec struct {
