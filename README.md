@@ -1,199 +1,226 @@
 # mathop-operator
 
-A Kubernetes operator built with [Kubebuilder](https://book.kubebuilder.io/) that chains
-Custom Resources together at runtime — modeled after Crossplane's composition pattern — so
-that **any** "Task" resource's result can be fed into **any** "Consumer" resource, without the
-Consumer ever having a compile-time dependency on the Task's Go type.
+A Kubernetes operator built with [Kubebuilder](https://book.kubebuilder.io/), evolved through
+three iterations from a fixed two-CRD demo into a generic, HTTP-driven workflow engine — modeled
+after Crossplane's composition pattern, where one resource's output becomes another's input,
+resolved entirely at runtime.
 
-Concretely, this repo ships two Task kinds (`Add`, `Subtract`) and one Consumer kind (`Square`),
-but the point of the design is that a brand-new Task kind can be introduced and wired up **with
-zero code changes to the Consumer** — only a new CRD, a new controller for that Task, and a
-config change (RBAC).
+## The three iterations, in order
 
-## What it does
+1. **Typed, in-cluster computation** — `Add` and `Subtract` compute directly in Go
+   (`status.result = x + y`), and `Square` reads a specific referenced resource's result and
+   squares it. Chaining works via a field indexer + watch, so editing `Add` automatically
+   recomputes any `Square` that depends on it.
+2. **Generic, runtime-discovered chaining** — `Square` was reworked to reference *any* resource
+   kind (`spec.sourceRef {apiVersion, kind, name}`), fetched as `unstructured.Unstructured`
+   rather than a typed Go struct, with a `DynamicWatcher` that registers watches for new kinds
+   the first time they're referenced — no code change or redeploy needed to support a brand-new
+   Task kind.
+3. **HTTP-driven workflow (current)** — the operator no longer computes anything itself. A
+   single generic `HTTPTask` kind represents "call this URL with this JSON, optionally built
+   from other tasks' outputs." The actual operation (add, square, or anything a vendor exposes)
+   lives outside the cluster, behind an HTTP endpoint.
 
-- **`Add`** — `spec.x`, `spec.y` → `status.result = x + y`
-- **`Subtract`** — `spec.x`, `spec.y` → `status.result = x - y`
-- **`Square`** — `spec.sourceRef {apiVersion, kind, name}` → reads the referenced object's
-  `status.result`, squares it, writes its own `status.result`
+All three layers are present in this repo; the sections below cover `HTTPTask`, the current
+focus, in depth, with the earlier layers summarized after.
+
+## What `HTTPTask` does
+
+- **`spec.endpoint`** — the URL to call
+- **`spec.method`** — HTTP method, defaults to `POST`
+- **`spec.headers`** — custom headers (e.g. API keys, auth tokens)
+- **`spec.input`** — a raw, schema-less JSON object — the base request body
+- **`spec.inputFrom`** — a list of field mappings, each pulling one field out of another
+  `HTTPTask`'s `status.output` and inserting it into this task's request body
+- **`status.output`** — the raw JSON response from the last successful call
+- **`status.statusCode`**, **`status.conditions`** — call result and human-readable state
 
 ```
-Add (x=6, y=9)  --status.result=15--> Square (sourceRef → that Add)  --status.result=225-->
-Subtract (x=50, y=8) --status.result=42--> Square (sourceRef → that Subtract) --status.result=1764-->
+task-add   (input: {x:5,y:7})        --POST /add-->     {"sum":12}
+task-square (inputFrom: task-add.sum --> value) --POST /square--> {"square":144}
 ```
 
-Both flows use the exact same `Square` controller code — it never imports `Add` or `Subtract`.
-
-## The core idea: a shared convention, not a shared type
-
-Any resource can act as a **Task** as long as its controller writes an integer to
-`status.result`. Any resource can act as a **Consumer** as long as it holds a
-`spec.sourceRef {apiVersion, kind, name}` pointing at a Task. That's the entire contract —
-no shared Go interface, no import between the two sides. This also composes: since `Square`
-itself writes `status.result`, a third resource could reference a `Square` as its own source,
-making genuine multi-stage pipelines possible, not just two-step chains.
+A task with no `inputFrom` is a "root" task — any number of these can exist side by side, each
+starting its own chain. A task's `inputFrom` can reference *any* prior task by name, not
+necessarily the one immediately before it, and can pull from more than one source at once.
 
 ## Architecture
 
 ```
 api/v1alpha1/
-  add_types.go            Add CRD schema
-  subtract_types.go        Subtract CRD schema
-  square_types.go           Square CRD schema (spec.sourceRef, not a typed reference)
-  groupversion_info.go       Registers the math.example.com/v1alpha1 API group
+  httptask_types.go     HTTPTask CRD: spec.endpoint/method/headers/input/inputFrom,
+                          status.output/statusCode/observedInputHash/conditions,
+                          plus FieldMapping and SourceReference
 
 internal/controller/
-  add_controller.go          AddReconciler — computes x + y, holds an in-use finalizer
-  subtract_controller.go      SubtractReconciler — computes x - y, holds an in-use finalizer
-  square_controller.go         SquareReconciler — thin: computes result², built on task_transfer.go
-  task_transfer.go              The reusable engine — see below
-  refcheck.go                    Shared "is this Task still referenced by a Square?" helper
+  httptask_controller.go   HTTPTaskReconciler — the orchestration logic (see below)
+  jsonpath.go                Tiny dot-path get/set helpers for arbitrary JSON (no arrays)
+  task_refcheck.go            "Is this task still referenced by another?" — for its finalizer
+  task_transfer.go             Shared sourceRefIndexValue() helper (also used by Square below);
+                                 also still holds FetchTaskResult/DynamicWatcher from iteration 2,
+                                 unused by HTTPTask itself since there's only one Kind now
 ```
 
-### `task_transfer.go` — the reusable "hand task 1's result to task 2" engine
+### `HTTPTaskReconciler.Reconcile`, step by step
 
-Two pieces, both fully generic — neither one imports `Add`, `Subtract`, or `Square`:
+1. **Finalizer bookkeeping** — attaches `math.example.com/task-in-use-protection` on creation;
+   on deletion, blocks (requeues every 5s) while any other task's `inputFrom` still references
+   this one.
+2. **Build the request body** — starts from `spec.input`, then for each `inputFrom` entry:
+   fetches the referenced task (plain typed `Get`, since every task shares one Kind), reads the
+   named field out of its `status.output` via `jsonpath.go`, writes it into this task's body. If
+   a dependency has no output yet, reports `WaitingOnSource` and stops — the watch below
+   re-triggers this once that dependency produces output.
+3. **Hashes the resolved body** and compares to `status.observedInputHash` — skips the actual
+   HTTP call if nothing has changed since the last successful one, since re-calling a real
+   external endpoint isn't free or necessarily idempotent the way in-cluster math was.
+4. **Sends the request** — method defaults to POST, custom headers applied, 10s timeout.
+5. **Records the response** — `status.output`, `status.statusCode`, and a `Ready` condition
+   based on the status code range (`Computed` for 2xx, `NonSuccessStatus` otherwise).
 
-- **`FetchTaskResult(ctx, client, namespace, apiVersion, kind, name)`** — fetches *any* resource
-  as `unstructured.Unstructured` (not a typed Go struct) and reads `status.result` out of it by
-  field name. This is the actual data-transfer line; it works identically no matter what kind is
-  referenced.
-- **`DynamicWatcher`** — a small runtime registry of "which GVKs am I already watching." The
-  first time a Consumer references a new Task kind, `DynamicWatcher.Ensure()` confirms that kind
-  actually exists on the cluster (via the RESTMapper) and registers a live watch for it on the
-  fly — no restart, no redeploy. Watches self-heal after a pod restart too, since every existing
-  Consumer object gets re-reconciled on startup, re-registering its own watch.
+### Chaining mechanism
 
-Any new Consumer (not just `Square`) can be built as a thin wrapper around these two pieces —
-plugging in only its own transform (e.g. `result := sum * sum` for Square, or `-sum` for a
-future `Negate`) and its own field-indexer/List boilerplate (a few lines, kept per-type since
-Go's typed `List` calls need a concrete list type).
+`SetupWithManager` registers a **multi-valued** field indexer on `.spec.inputFrom.sourceRef`
+(multi-valued because one task can depend on several others at once), then sets up a
+**self-referencing watch**: `.For(&HTTPTask{})` and `.Watches(&HTTPTask{}, ...)` both target the
+same type. `findDependentTasks` maps a changed task to every other task whose `inputFrom` points
+at it, re-queuing those — so editing `task-add` automatically re-triggers `task-square`.
 
-### Reference-protection finalizers
+### Where results live
 
-`Add` and `Subtract` both carry the finalizer `math.example.com/in-use-protection`. On deletion,
-each checks (via `refcheck.go`'s `referencedBySquare`) whether any `Square` still points at it;
-if so, deletion is blocked (requeued every 5s) until the referencing `Square` is removed. This
-mirrors Kubernetes' own PVC-protection pattern. It's a deliberate, one-directional coupling —
-Tasks know about the existence of `Square`'s index, not the reverse — documented here rather than
-hidden, since fully generic n-to-n reference protection would need a bigger design (closer to how
-core Kubernetes' garbage collector uses `ownerReferences`).
+`status.output` is a real field persisted to **etcd** via the API server — not a cache, not
+temporary. The informer cache each controller uses is only a local, auto-synced read mirror; it's
+rebuilt from etcd on restart and never the source of truth.
 
-### Status and conditions
+### A known gotcha, worth remembering
 
-Every type reports a `Ready` condition (`metav1.Condition`) alongside its numeric result, with
-reasons like `Computed`, `SourceNotFound`, `WaitingOnSource`, `SourceKindUnavailable` — so
-`kubectl describe` gives a clear, human-readable explanation of state, not just a raw number.
-
-### Where results actually live (not a cache)
-
-`status.result` is a real, persisted field written to **etcd** via the Kubernetes API server —
-not a temporary or in-memory value. When a Consumer's controller reads it via `FetchTaskResult`,
-it's reading that same persisted field back out. The informer cache each controller uses
-(`mgr.GetCache()`, used by every `Get`/`List`/`Watch`) is only a local, auto-synced mirror kept
-for read performance — it's not where data is stored, and losing it (e.g. on pod restart) loses
-nothing, since it's rebuilt from etcd automatically.
-
-### Leader election & caching — already provided by controller-runtime
-
-- **Caches/informers**: every `Get`/`List`/`Watch` in this project already goes through
-  controller-runtime's shared, watch-based cache by default. Nothing extra was added for this —
-  it's inherent to the framework.
-- **Leader election**: scaffolded in `cmd/main.go` (`--leader-elect` flag, `LeaderElectionID` on
-  the manager). It only matters if the Deployment is scaled to multiple replicas — it ensures
-  only one replica actively reconciles at a time.
+`spec.input` and `spec.inputFrom`'s field paths are free-form JSON/YAML with no CRD schema
+validation on their contents. A bare `y:` key in YAML is parsed as the boolean `true` (YAML 1.1),
+not the string `"y"` — always quote it as `"y":`. Unlike the earlier typed `Add`/`Subtract` CRDs
+(where a malformed field was rejected outright by schema validation), a mistake here just
+silently produces a wrong request body — a real tradeoff of going schema-less for generality.
 
 ## Prerequisites
 
-- Go 1.21+
-- Docker
-- kubectl
-- [kind](https://kind.sigs.k8s.io/)
-- [kubebuilder](https://book.kubebuilder.io/quick-start.html)
+- Go 1.21+, Docker, kubectl, [kind](https://kind.sigs.k8s.io/),
+  [kubebuilder](https://book.kubebuilder.io/quick-start.html), Python 3 (for the demo endpoint)
 
 ## Getting started
 
 ```bash
 kind create cluster --name mathop
-
-make manifests generate   # regenerate CRDs/RBAC/deepcopy after any type changes
-make install                # install all CRDs into the cluster
-make run                     # run the controller locally, logs to stdout
+make manifests generate
+make install
+make run          # leave running
 ```
 
-In another terminal — note the quoted `"y":` (a bare `y:` key is parsed as the YAML 1.1 boolean
-`true`, not the string `"y"`):
+In another terminal, start a demo HTTP endpoint (plain Python process, nothing Kubernetes-aware
+— stands in for a real vendor API). Save as `mock_server.py`:
+
+```python
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
+
+class Handler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        length = int(self.headers.get('Content-Length', 0))
+        body = json.loads(self.rfile.read(length) or b'{}')
+
+        if self.path == '/add':
+            result = {"sum": body.get("x", 0) + body.get("y", 0)}
+        elif self.path == '/square':
+            v = body.get("value", 0)
+            result = {"square": v * v}
+        else:
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        payload = json.dumps(result).encode()
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, format, *args):
+        print(f"[mock_server] {self.path} <- {args}")
+
+ThreadingHTTPServer(("0.0.0.0", 9090), Handler).serve_forever()
+```
+
+```bash
+python3 mock_server.py   # leave running; ThreadingHTTPServer avoids one slow request blocking all others
+```
+
+Create a root task and a dependent task, using `127.0.0.1` rather than `localhost` (avoids a
+Go/IPv6-resolution stall some environments hit):
 
 ```bash
 cat <<'EOF' | kubectl apply -f -
 apiVersion: math.example.com/v1alpha1
-kind: Add
+kind: HTTPTask
 metadata:
-  name: demo-add
+  name: task-add
 spec:
-  x: 6
-  "y": 9
+  endpoint: http://127.0.0.1:9090/add
+  input:
+    x: 5
+    "y": 7
 EOF
+
+kubectl get httptask task-add -o jsonpath='{.status.output}'; echo   # {"sum":12}
 
 cat <<'EOF' | kubectl apply -f -
 apiVersion: math.example.com/v1alpha1
-kind: Square
+kind: HTTPTask
 metadata:
-  name: demo-square
+  name: task-square
 spec:
-  sourceRef:
-    apiVersion: math.example.com/v1alpha1
-    kind: Add
-    name: demo-add
+  endpoint: http://127.0.0.1:9090/square
+  inputFrom:
+  - sourceRef:
+      apiVersion: math.example.com/v1alpha1
+      kind: HTTPTask
+      name: task-add
+    sourceField: sum
+    targetField: value
 EOF
 
-kubectl get add demo-add        # RESULT: 15
-kubectl get square demo-square  # RESULT: 225
+kubectl get httptask task-square -o jsonpath='{.status.output}'; echo   # {"square":144}
 ```
 
-Prove the chaining reacts live, by editing only the `Add`:
+Prove chaining reacts live:
 
 ```bash
-kubectl patch add demo-add --type=merge -p '{"spec":{"x":20,"y":30}}'
-kubectl get square demo-square   # RESULT updates to 2500, without touching Square at all
-```
-
-Prove `Square` works against a completely different Task kind, with no code changes:
-
-```bash
-cat <<'EOF' | kubectl apply -f -
-apiVersion: math.example.com/v1alpha1
-kind: Subtract
-metadata:
-  name: demo-subtract
-spec:
-  x: 50
-  "y": 8
-EOF
-
-cat <<'EOF' | kubectl apply -f -
-apiVersion: math.example.com/v1alpha1
-kind: Square
-metadata:
-  name: square-from-subtract
-spec:
-  sourceRef:
-    apiVersion: math.example.com/v1alpha1
-    kind: Subtract
-    name: demo-subtract
-EOF
-
-kubectl get subtract demo-subtract        # RESULT: 42
-kubectl get square square-from-subtract   # RESULT: 1764
+kubectl patch httptask task-add --type=merge -p '{"spec":{"input":{"x":20,"y":30}}}'
+kubectl get httptask task-square -o jsonpath='{.status.output}'; echo   # {"square":2500}
 ```
 
 Prove the reference-protection finalizer:
 
 ```bash
-kubectl delete add demo-add --timeout=10s   # hangs/times out — demo-square still references it
-kubectl delete square demo-square
-kubectl delete add demo-add                  # succeeds immediately now
+kubectl delete httptask task-add --timeout=10s   # hangs — task-square still references it
+kubectl delete httptask task-square
+kubectl delete httptask task-add                  # succeeds immediately
 ```
+
+## The earlier layers (still present, still functional)
+
+- **`api/v1alpha1/add_types.go` / `internal/controller/add_controller.go`** — `Add`: computes
+  `x + y` natively, carries the `in-use-protection` finalizer.
+- **`api/v1alpha1/subtract_types.go` / `internal/controller/subtract_controller.go`** — same
+  pattern, `x - y`.
+- **`api/v1alpha1/square_types.go` / `internal/controller/square_controller.go`** — reads any
+  referenced resource's `status.result` generically (via `task_transfer.go`'s
+  `FetchTaskResult`/`DynamicWatcher`) and squares it. Wildcard RBAC
+  (`resources=*,verbs=get;list;watch` on `math.example.com`) lets it read any future typed kind
+  in that group without new config.
+- **`internal/controller/refcheck.go`** — `Add`/`Subtract`'s reference-protection check against
+  `Square`.
+
+These demonstrate the progression from fixed, typed CRDs to generic runtime discovery, ahead of
+the fully external, HTTP-driven `HTTPTask` design above.
 
 ## Running the automated test suite
 
@@ -201,46 +228,20 @@ kubectl delete add demo-add                  # succeeds immediately now
 make test
 ```
 
-Spins up a real (lightweight) control plane via `envtest` and verifies both the initial
-computation and the chained recomputation after a source update.
-
-## Deploying in-cluster (instead of `make run` on your machine)
+## Deploying in-cluster
 
 ```bash
 make docker-build IMG=mathop-operator:v0.1.0
 kind load docker-image mathop-operator:v0.1.0 --name mathop
 make deploy IMG=mathop-operator:v0.1.0
-
-kubectl get pods -n mathop-operator-system
 kubectl logs -n mathop-operator-system deploy/mathop-operator-controller-manager -c manager -f
 ```
 
-Tear down with `make undeploy && make uninstall`.
-
-## Extending with a new Task kind — the point of this design
-
-1. `kubebuilder create api --group math --version v1alpha1 --kind <NewKind>`
-2. Write its `_types.go` (spec + `status.result` + `status.conditions`) and controller, following
-   `add_types.go`/`add_controller.go` as the template.
-3. Grant RBAC — already handled by the wildcard rule on `square_controller.go`
-   (`+kubebuilder:rbac:groups=math.example.com,resources=*,verbs=get;list;watch`), so no new RBAC
-   rule is needed as long as the new kind stays in the `math.example.com` group.
-4. `make manifests generate && make deploy`
-5. `kubectl apply` a `Square` with `sourceRef.kind: <NewKind>` — done. `square_controller.go` and
-   `task_transfer.go` are never touched.
-
-## Failure handling
-
-- `Square` referencing a nonexistent source → `Ready=False, Reason=SourceNotFound`
-- `Square` referencing a source that hasn't computed a result yet → `Ready=False,
-  Reason=WaitingOnSource` (resolves automatically once the source writes its result, via the
-  same watch)
-- `Square` referencing an unrecognized/uninstalled kind → `Ready=False,
-  Reason=SourceKindUnavailable`
-- Deleting a Task still referenced by a `Square` → blocked by the in-use finalizer until the
-  reference is removed
+Note: an in-cluster pod can't reach a `127.0.0.1` process running directly on your WSL host —
+that only works with `make run`. Reaching a host-machine endpoint from inside `kind` needs the
+node's host-gateway address instead; ask if you need this wired up for a deployed demo.
 
 ## Built with
 
-Scaffolded with `kubebuilder`, using `sigs.k8s.io/controller-runtime` for the reconciliation
-loop, manager, dynamic watch registration, and field indexing.
+`kubebuilder`, `sigs.k8s.io/controller-runtime` (reconciliation loop, manager, dynamic watch
+registration, field indexing), Go's standard `net/http` for the HTTP orchestration layer.
