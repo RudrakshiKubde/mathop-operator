@@ -8,6 +8,14 @@ class Handler(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(length) or b'{}')
 
         if self.path == '/add':
+            if 'x' not in body or 'y' not in body:
+                self.send_response(400)
+                self.send_header('Content-Type', 'application/json')
+                payload = json.dumps({"error": "x and y are required"}).encode()
+                self.send_header('Content-Length', str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
             result = {"sum": body.get("x", 0) + body.get("y", 0)}
         elif self.path == '/square':
             v = body.get("value", 0)

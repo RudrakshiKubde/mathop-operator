@@ -19,6 +19,7 @@ rules:
   - httptasks
   - squares
   - subtracts
+  - workflows
   verbs:
   - create
   - delete
@@ -43,6 +44,7 @@ rules:
   - httptasks/status
   - squares/status
   - subtracts/status
+  - workflows/status
   verbs:
   - get
   - patch

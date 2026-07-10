@@ -37,6 +37,7 @@ import (
 
 	mathv1alpha1 "github.com/RudrakshiKubde/mathop-operator/api/v1alpha1"
 	"github.com/RudrakshiKubde/mathop-operator/internal/controller"
+	"github.com/RudrakshiKubde/mathop-operator/internal/statusserver"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -199,6 +200,21 @@ func main() {
 		setupLog.Error(err, "Failed to create controller", "controller", "subtract")
 		os.Exit(1)
 	}
+
+	if err = (&controller.WorkflowReconciler{
+		Client:           mgr.GetClient(),
+		Scheme:           mgr.GetScheme(),
+		DashboardBaseURL: "http://localhost:8090",
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "Workflow")
+		os.Exit(1)
+	}
+
+	if err := mgr.Add(&statusserver.Server{Client: mgr.GetClient(), Addr: ":8090"}); err != nil {
+		setupLog.Error(err, "unable to add status server")
+		os.Exit(1)
+	}
+
 	if err := (&controller.HTTPTaskReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
@@ -222,4 +238,5 @@ func main() {
 		setupLog.Error(err, "Failed to run manager")
 		os.Exit(1)
 	}
+
 }

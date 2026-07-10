@@ -1,109 +1,118 @@
 # mathop-operator
 
-A Kubernetes operator built with [Kubebuilder](https://book.kubebuilder.io/), evolved through
-three iterations from a fixed two-CRD demo into a generic, HTTP-driven workflow engine — modeled
-after Crossplane's composition pattern, where one resource's output becomes another's input,
-resolved entirely at runtime.
+A Kubernetes operator built with [Kubebuilder](https://book.kubebuilder.io/), evolved from a
+fixed two-CRD demo into a generic, HTTP-driven workflow engine with live progress tracking —
+modeled after Crossplane's composition pattern, where one resource's output becomes another's
+input, resolved entirely at runtime.
 
-## The three iterations, in order
+## The four iterations, in order
 
-1. **Typed, in-cluster computation** — `Add` and `Subtract` compute directly in Go
-   (`status.result = x + y`), and `Square` reads a specific referenced resource's result and
-   squares it. Chaining works via a field indexer + watch, so editing `Add` automatically
-   recomputes any `Square` that depends on it.
-2. **Generic, runtime-discovered chaining** — `Square` was reworked to reference *any* resource
-   kind (`spec.sourceRef {apiVersion, kind, name}`), fetched as `unstructured.Unstructured`
-   rather than a typed Go struct, with a `DynamicWatcher` that registers watches for new kinds
-   the first time they're referenced — no code change or redeploy needed to support a brand-new
-   Task kind.
-3. **HTTP-driven workflow (current)** — the operator no longer computes anything itself. A
-   single generic `HTTPTask` kind represents "call this URL with this JSON, optionally built
-   from other tasks' outputs." The actual operation (add, square, or anything a vendor exposes)
-   lives outside the cluster, behind an HTTP endpoint.
+1. **Typed, in-cluster computation** — `Add`/`Subtract` compute directly in Go; `Square` reads a
+   referenced resource's result and squares it, chained via a field indexer + watch.
+2. **Generic, runtime-discovered chaining** — `Square` reworked to reference *any* resource kind
+   generically (`unstructured.Unstructured` + a `DynamicWatcher` that registers watches for new
+   kinds the first time they're referenced) — no code change needed for a new Task kind.
+3. **HTTP-driven tasks** — `HTTPTask`: a single generic kind representing "call this URL with
+   this JSON, optionally built from other tasks' outputs." The operator stops computing anything
+   itself; the actual operation lives behind a real HTTP endpoint.
+4. **Workflows with live status (current)** — `Workflow`: groups multiple `HTTPTask` steps under
+   one object, with a transaction ID, a live-updating dashboard URL, and an optional one-shot
+   webhook notification on completion.
 
-All three layers are present in this repo; the sections below cover `HTTPTask`, the current
-focus, in depth, with the earlier layers summarized after.
+This README focuses on iteration 4; the earlier layers remain in the repo and are functional.
 
-## What `HTTPTask` does
+## What `Workflow` does
 
-- **`spec.endpoint`** — the URL to call
-- **`spec.method`** — HTTP method, defaults to `POST`
-- **`spec.headers`** — custom headers (e.g. API keys, auth tokens)
-- **`spec.input`** — a raw, schema-less JSON object — the base request body
-- **`spec.inputFrom`** — a list of field mappings, each pulling one field out of another
-  `HTTPTask`'s `status.output` and inserting it into this task's request body
-- **`status.output`** — the raw JSON response from the last successful call
-- **`status.statusCode`**, **`status.conditions`** — call result and human-readable state
+- **`spec.tasks`** — an embedded, ordered list of steps (endpoint, method, headers, input, and
+  `inputFrom` mappings referencing *other steps in the same workflow* by name)
+- **`spec.notifyURL`** — optional; if set, the operator `POST`s the final status here exactly
+  once, the moment the workflow reaches `Succeeded` or `Failed`
+- **`status.transactionID`** — a stable, unique ID (the object's own UID) for external correlation
+- **`status.dashboardURL`** — a live, human-visitable URL showing real-time per-task progress
+- **`status.phase`** / **`status.tasks[].phase`** — `Pending` → `Running` → `Succeeded`/`Failed`,
+  per step and overall, with the specific error message attached to whichever step failed
 
 ```
-task-add   (input: {x:5,y:7})        --POST /add-->     {"sum":12}
-task-square (inputFrom: task-add.sum --> value) --POST /square--> {"square":144}
+Workflow "demo"
+  ├─ step "add"     → creates/owns HTTPTask "demo-add"
+  └─ step "square"  → creates/owns HTTPTask "demo-square", inputFrom: add.sum → value
 ```
 
-A task with no `inputFrom` is a "root" task — any number of these can exist side by side, each
-starting its own chain. A task's `inputFrom` can reference *any* prior task by name, not
-necessarily the one immediately before it, and can pull from more than one source at once.
+`WorkflowReconciler` doesn't compute anything itself — it materializes a real, owned `HTTPTask`
+child object per embedded step (reusing all of `HTTPTask`'s existing logic unchanged: hashing,
+skip-if-unchanged, chaining, finalizers), then aggregates each child's live status back into
+`workflow.status`.
 
 ## Architecture
 
 ```
 api/v1alpha1/
-  httptask_types.go     HTTPTask CRD: spec.endpoint/method/headers/input/inputFrom,
-                          status.output/statusCode/observedInputHash/conditions,
-                          plus FieldMapping and SourceReference
+  workflow_types.go       Workflow CRD: spec.tasks[]/notifyURL, status.transactionID/
+                            dashboardURL/phase/tasks[]/notifiedPhase/conditions
 
 internal/controller/
-  httptask_controller.go   HTTPTaskReconciler — the orchestration logic (see below)
-  jsonpath.go                Tiny dot-path get/set helpers for arbitrary JSON (no arrays)
-  task_refcheck.go            "Is this task still referenced by another?" — for its finalizer
-  task_transfer.go             Shared sourceRefIndexValue() helper (also used by Square below);
-                                 also still holds FetchTaskResult/DynamicWatcher from iteration 2,
-                                 unused by HTTPTask itself since there's only one Kind now
+  workflow_controller.go    WorkflowReconciler — creates/owns child HTTPTasks, aggregates
+                              status, sends the one-shot notifyURL callback
+  httptask_controller.go     (updated) now writes a "Running" status BEFORE making the HTTP
+                               call, not just after — makes in-flight state actually observable
+
+internal/statusserver/
+  server.go                  Embedded HTTP server (runs inside the operator process):
+                               GET /workflows/{id}            → live HTML dashboard (SSE-driven)
+                               GET /api/workflows/{id}         → JSON snapshot
+                               GET /api/workflows/stream/{id}  → Server-Sent Events, push-based
+
+watch_workflow.py             Terminal equivalent of the browser dashboard — connects to the
+                                same SSE stream, prints live task-by-task progress
+notify_listener.py             Mock webhook receiver for testing spec.notifyURL
 ```
 
-### `HTTPTaskReconciler.Reconcile`, step by step
+### `WorkflowReconciler.Reconcile`, step by step
 
-1. **Finalizer bookkeeping** — attaches `math.example.com/task-in-use-protection` on creation;
-   on deletion, blocks (requeues every 5s) while any other task's `inputFrom` still references
-   this one.
-2. **Build the request body** — starts from `spec.input`, then for each `inputFrom` entry:
-   fetches the referenced task (plain typed `Get`, since every task shares one Kind), reads the
-   named field out of its `status.output` via `jsonpath.go`, writes it into this task's body. If
-   a dependency has no output yet, reports `WaitingOnSource` and stops — the watch below
-   re-triggers this once that dependency produces output.
-3. **Hashes the resolved body** and compares to `status.observedInputHash` — skips the actual
-   HTTP call if nothing has changed since the last successful one, since re-calling a real
-   external endpoint isn't free or necessarily idempotent the way in-cluster math was.
-4. **Sends the request** — method defaults to POST, custom headers applied, 10s timeout.
-5. **Records the response** — `status.output`, `status.statusCode`, and a `Ready` condition
-   based on the status code range (`Computed` for 2xx, `NonSuccessStatus` otherwise).
+1. Sets `status.transactionID` (= object UID) and `status.dashboardURL` if not already set.
+2. For each embedded step: builds a `FieldMapping` translating `sourceStep` (a name within this
+   workflow) into a full `HTTPTask` `SourceRef`, then `controllerutil.CreateOrUpdate`s a child
+   `HTTPTask` named `<workflow>-<step>`, with `ctrl.SetControllerReference` so Kubernetes
+   garbage-collects children automatically when the `Workflow` is deleted.
+3. Reads each child's `Ready` condition and maps it to a per-step phase:
+   - no condition yet → `Pending`
+   - `Reason: Running` → `Running` (see below)
+   - `Reason: WaitingOnSource` → `Pending`
+   - `Status: True` → `Succeeded`
+   - anything else → `Failed`, with `error` set to `"<Reason>: <Message>"`
+4. Computes the **overall** phase only *after* the full loop, from two booleans (`hasFailed`,
+   `hasPending`) collected across every step — not by letting the last-processed step overwrite
+   an earlier one. `Failed` beats `Running` beats `Succeeded`, regardless of step order.
+5. If the overall phase is now terminal (`Succeeded`/`Failed`) and hasn't already been notified
+   for that exact phase (`status.notifiedPhase`), `POST`s the full `status` to `spec.notifyURL`
+   once. A failed notify attempt retries in 10s without re-running the task loop.
 
-### Chaining mechanism
+`.Owns(&HTTPTask{})` re-triggers the `Workflow`'s reconcile whenever any child's status changes —
+this is what keeps the aggregated view current as each step progresses.
 
-`SetupWithManager` registers a **multi-valued** field indexer on `.spec.inputFrom.sourceRef`
-(multi-valued because one task can depend on several others at once), then sets up a
-**self-referencing watch**: `.For(&HTTPTask{})` and `.Watches(&HTTPTask{}, ...)` both target the
-same type. `findDependentTasks` maps a changed task to every other task whose `inputFrom` points
-at it, re-queuing those — so editing `task-add` automatically re-triggers `task-square`.
+### Making "Running" real
 
-### Where results live
+A synchronous HTTP call has no natural "in progress" state to observe from outside — it's either
+not started or already done. `httptask_controller.go` now writes a `Ready=False, Reason=Running`
+condition via its own `Status().Update()` **before** calling `r.HTTPClient.Do(...)`, so that write
+lands in etcd and becomes visible before the (possibly slow) call even begins — not a cosmetic
+label applied after the fact.
 
-`status.output` is a real field persisted to **etcd** via the API server — not a cache, not
-temporary. The informer cache each controller uses is only a local, auto-synced read mirror; it's
-rebuilt from etcd on restart and never the source of truth.
+### The live dashboard
 
-### A known gotcha, worth remembering
+`/workflows/{id}` serves a small HTML page that: fetches the current status once immediately
+(`fetch('/api/workflows/...')`), then opens a `Server-Sent Events` connection to
+`/api/workflows/stream/{id}` and re-renders on every pushed update. The server-side stream
+handler polls the workflow object every second, only pushes a frame when the JSON actually
+changed, and closes the connection once the workflow reaches a terminal phase — the page never
+needs a manual refresh.
 
-`spec.input` and `spec.inputFrom`'s field paths are free-form JSON/YAML with no CRD schema
-validation on their contents. A bare `y:` key in YAML is parsed as the boolean `true` (YAML 1.1),
-not the string `"y"` — always quote it as `"y":`. Unlike the earlier typed `Add`/`Subtract` CRDs
-(where a malformed field was rejected outright by schema validation), a mistake here just
-silently produces a wrong request body — a real tradeoff of going schema-less for generality.
+`watch_workflow.py` is the same idea for a terminal: it opens the same SSE endpoint directly and
+prints the same task-by-task breakdown as it arrives.
 
 ## Prerequisites
 
-- Go 1.21+, Docker, kubectl, [kind](https://kind.sigs.k8s.io/),
-  [kubebuilder](https://book.kubebuilder.io/quick-start.html), Python 3 (for the demo endpoint)
+Same as before — Go 1.21+, Docker, kubectl, kind, kubebuilder, Python 3.
 
 ## Getting started
 
@@ -111,137 +120,75 @@ silently produces a wrong request body — a real tradeoff of going schema-less 
 kind create cluster --name mathop
 make manifests generate
 make install
-make run          # leave running
+make run   # leave running
 ```
 
-In another terminal, start a demo HTTP endpoint (plain Python process, nothing Kubernetes-aware
-— stands in for a real vendor API). Save as `mock_server.py`:
-
-```python
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-import json
-
-class Handler(BaseHTTPRequestHandler):
-    def do_POST(self):
-        length = int(self.headers.get('Content-Length', 0))
-        body = json.loads(self.rfile.read(length) or b'{}')
-
-        if self.path == '/add':
-            result = {"sum": body.get("x", 0) + body.get("y", 0)}
-        elif self.path == '/square':
-            v = body.get("value", 0)
-            result = {"square": v * v}
-        else:
-            self.send_response(404)
-            self.end_headers()
-            return
-
-        payload = json.dumps(result).encode()
-        self.send_response(200)
-        self.send_header('Content-Type', 'application/json')
-        self.send_header('Content-Length', str(len(payload)))
-        self.end_headers()
-        self.wfile.write(payload)
-
-    def log_message(self, format, *args):
-        print(f"[mock_server] {self.path} <- {args}")
-
-ThreadingHTTPServer(("0.0.0.0", 9090), Handler).serve_forever()
-```
+Start the demo HTTP endpoint (from the `HTTPTask` iteration — `mock_server.py`, with the
+missing-field 400 check) and, separately, the mock notification receiver:
 
 ```bash
-python3 mock_server.py   # leave running; ThreadingHTTPServer avoids one slow request blocking all others
+python3 mock_server.py        # port 9090, leave running
+python3 notify_listener.py    # port 9091, leave running
 ```
 
-Create a root task and a dependent task, using `127.0.0.1` rather than `localhost` (avoids a
-Go/IPv6-resolution stall some environments hit):
+Create a workflow with a deliberately broken first step, so you can watch the full
+Pending→Running→Failed sequence live:
 
 ```bash
 cat <<'EOF' | kubectl apply -f -
 apiVersion: math.example.com/v1alpha1
-kind: HTTPTask
+kind: Workflow
 metadata:
-  name: task-add
+  name: notify-fail-demo
 spec:
-  endpoint: http://127.0.0.1:9090/add
-  input:
-    x: 5
-    "y": 7
+  notifyURL: http://127.0.0.1:9091/webhook
+  tasks:
+  - name: add
+    endpoint: http://127.0.0.1:9090/add
+    input:
+      x: 5
+  - name: square
+    endpoint: http://127.0.0.1:9090/square
+    inputFrom:
+    - sourceStep: add
+      sourceField: sum
+      targetField: value
 EOF
-
-kubectl get httptask task-add -o jsonpath='{.status.output}'; echo   # {"sum":12}
-
-cat <<'EOF' | kubectl apply -f -
-apiVersion: math.example.com/v1alpha1
-kind: HTTPTask
-metadata:
-  name: task-square
-spec:
-  endpoint: http://127.0.0.1:9090/square
-  inputFrom:
-  - sourceRef:
-      apiVersion: math.example.com/v1alpha1
-      kind: HTTPTask
-      name: task-add
-    sourceField: sum
-    targetField: value
-EOF
-
-kubectl get httptask task-square -o jsonpath='{.status.output}'; echo   # {"square":144}
 ```
 
-Prove chaining reacts live:
+Get the transaction ID and watch it live, two ways:
 
 ```bash
-kubectl patch httptask task-add --type=merge -p '{"spec":{"input":{"x":20,"y":30}}}'
-kubectl get httptask task-square -o jsonpath='{.status.output}'; echo   # {"square":2500}
+TXID=$(kubectl get workflow notify-fail-demo -o jsonpath='{.status.transactionID}')
+echo "$TXID"
+
+# in a browser:
+echo "http://localhost:8090/workflows/$TXID"
+
+# or in a terminal:
+python3 watch_workflow.py "$TXID"
 ```
 
-Prove the reference-protection finalizer:
+Watch `notify_listener.py`'s terminal too — once the workflow reaches `Failed`, it prints the
+same breakdown, delivered via the one-shot `notifyURL` callback, independent of whether you were
+watching the dashboard or not.
 
-```bash
-kubectl delete httptask task-add --timeout=10s   # hangs — task-square still references it
-kubectl delete httptask task-square
-kubectl delete httptask task-add                  # succeeds immediately
-```
+Fix the input and reapply (delete first, to reset `notifiedPhase` for a clean re-test) to see the
+success path end to end, including a fresh notification for the new outcome.
 
-## The earlier layers (still present, still functional)
+## A note on the health-probe port
 
-- **`api/v1alpha1/add_types.go` / `internal/controller/add_controller.go`** — `Add`: computes
-  `x + y` natively, carries the `in-use-protection` finalizer.
-- **`api/v1alpha1/subtract_types.go` / `internal/controller/subtract_controller.go`** — same
-  pattern, `x - y`.
-- **`api/v1alpha1/square_types.go` / `internal/controller/square_controller.go`** — reads any
-  referenced resource's `status.result` generically (via `task_transfer.go`'s
-  `FetchTaskResult`/`DynamicWatcher`) and squares it. Wildcard RBAC
-  (`resources=*,verbs=get;list;watch` on `math.example.com`) lets it read any future typed kind
-  in that group without new config.
-- **`internal/controller/refcheck.go`** — `Add`/`Subtract`'s reference-protection check against
-  `Square`.
+`main.go`'s health/readiness probe (`healthz`/`readyz`) defaults to `:8081`, separate from the
+dashboard's `:8090`. They're easy to confuse when testing — if a `curl` to the dashboard port
+returns a bare `404 page not found`, double-check you're hitting `8090`, not `8081`.
 
-These demonstrate the progression from fixed, typed CRDs to generic runtime discovery, ahead of
-the fully external, HTTP-driven `HTTPTask` design above.
+## Running the automated test suite / deploying in-cluster
 
-## Running the automated test suite
-
-```bash
-make test
-```
-
-## Deploying in-cluster
-
-```bash
-make docker-build IMG=mathop-operator:v0.1.0
-kind load docker-image mathop-operator:v0.1.0 --name mathop
-make deploy IMG=mathop-operator:v0.1.0
-kubectl logs -n mathop-operator-system deploy/mathop-operator-controller-manager -c manager -f
-```
-
-Note: an in-cluster pod can't reach a `127.0.0.1` process running directly on your WSL host —
-that only works with `make run`. Reaching a host-machine endpoint from inside `kind` needs the
-node's host-gateway address instead; ask if you need this wired up for a deployed demo.
+Unchanged from before — see `make test`, `make docker-build` / `make deploy`. As before, an
+in-cluster pod can't reach a `127.0.0.1` process on your WSL host; this workflow demo assumes
+`make run` (operator as a local process) alongside locally-run mock servers.
 
 ## Built with
 
-`kubebuilder`, `sigs.k8s.io/controller-runtime` (reconciliation loop, manager, dynamic watch
-registration, field indexing), Go's standard `net/http` for the HTTP orchestration layer.
+`kubebuilder`, `sigs.k8s.io/controller-runtime`, Go's `net/http` (both for outbound task calls and
+the embedded dashboard/SSE server), `html/template` for the dashboard page.

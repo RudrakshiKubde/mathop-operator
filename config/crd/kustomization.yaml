@@ -6,6 +6,7 @@ resources:
 - bases/math.example.com_squares.yaml
 - bases/math.example.com_subtracts.yaml
 - bases/math.example.com_httptasks.yaml
+- bases/math.example.com_workflows.yaml
 # +kubebuilder:scaffold:crdkustomizeresource
 
 patches:
