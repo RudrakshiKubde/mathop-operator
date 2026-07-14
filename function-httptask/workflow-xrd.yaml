@@ -1,0 +1,77 @@
+apiVersion: apiextensions.crossplane.io/v1
+kind: CompositeResourceDefinition
+metadata:
+  name: workflows.example.crossplane.io
+spec:
+  group: example.crossplane.io
+  names:
+    kind: Workflow
+    plural: workflows
+  versions:
+  - name: v1
+    served: true
+    referenceable: true
+    schema:
+      openAPIV3Schema:
+        type: object
+        properties:
+          spec:
+            type: object
+            properties:
+              tasks:
+                type: array
+                items:
+                  type: object
+                  required: ["name", "endpoint"]
+                  properties:
+                    name:
+                      type: string
+                    endpoint:
+                      type: string
+                    method:
+                      type: string
+                    headers:
+                      type: object
+                      additionalProperties:
+                        type: string
+                    input:
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
+                    inputFrom:
+                      type: array
+                      items:
+                        type: object
+                        required: ["sourceTask", "sourceField", "targetField"]
+                        properties:
+                          sourceTask:
+                            type: string
+                          sourceField:
+                            type: string
+                          targetField:
+                            type: string
+            required: ["tasks"]
+          status:
+            type: object
+            properties:
+              transactionID:
+                type: string
+              dashboardURL:
+                type: string
+              phase:
+                type: string
+              tasks:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    name:
+                      type: string
+                    phase:
+                      type: string
+                    statusCode:
+                      type: integer
+                    output:
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
+                    error:
+                      type: string

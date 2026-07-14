@@ -1,0 +1,17 @@
+apiVersion: example.crossplane.io/v1
+kind: Workflow
+metadata:
+  name: example-xr
+spec:
+  tasks:
+  - name: add
+    endpoint: http://mock-server.default.svc.cluster.local:9090/add
+    input:
+      x: 5
+      "y": 7
+  - name: square
+    endpoint: http://mock-server.default.svc.cluster.local:9090/square
+    inputFrom:
+    - sourceTask: add
+      sourceField: sum
+      targetField: value
