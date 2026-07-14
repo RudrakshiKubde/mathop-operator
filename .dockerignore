@@ -9,3 +9,10 @@
 # Re-include Go module files
 !go.mod
 !go.sum
+
+# Re-include the mock server script
+!mock_server.py
+
+# Exclude the nested function-httptask project from the build context
+function-httptask/
+!function-httptask/mock_server_unused_placeholder  # (no-op, just documenting intent)

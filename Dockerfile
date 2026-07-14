@@ -21,6 +21,13 @@ COPY . .
 # by leaving it empty we can ensure that the container and binary shipped on it will have the same platform.
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o manager cmd/main.go
 
+
+FROM python:3.12-slim AS mockserver
+COPY mock_server.py /mock_server.py
+EXPOSE 9090
+CMD ["python3", "/mock_server.py"]
+
+
 # Use distroless as minimal base image to package the manager binary
 # Refer to https://github.com/GoogleContainerTools/distroless for more details
 FROM gcr.io/distroless/static:nonroot

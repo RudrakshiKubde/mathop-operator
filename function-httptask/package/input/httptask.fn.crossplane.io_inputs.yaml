@@ -1,0 +1,98 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.20.0
+  name: inputs.httptask.fn.crossplane.io
+spec:
+  group: httptask.fn.crossplane.io
+  names:
+    categories:
+    - crossplane
+    kind: Input
+    listKind: InputList
+    plural: inputs
+    singular: input
+  scope: Namespaced
+  versions:
+  - name: v1beta1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          Input is this Function's per-pipeline-step configuration — the Composition
+          Function equivalent of HTTPTaskSpec from the operator.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          contextKey:
+            description: |-
+              ContextKey is where this step's own parsed JSON response gets stored
+              in the shared pipeline context, so LATER steps can reference it via
+              their own InputFrom.
+            type: string
+          endpoint:
+            description: Endpoint is the URL to call.
+            type: string
+          headers:
+            additionalProperties:
+              type: string
+            description: Headers are custom HTTP headers.
+            type: object
+          inputFrom:
+            description: |-
+              InputFrom pulls fields from earlier pipeline steps' outputs into this
+              step's request body.
+            items:
+              description: |-
+                ContextFieldMapping pulls one field out of an EARLIER pipeline step's
+                output (stored in the shared pipeline context under SourceContextKey) and
+                places it into THIS step's outgoing request body.
+              properties:
+                sourceContextKey:
+                  description: |-
+                    SourceContextKey is the pipeline context key an earlier step wrote its
+                    output under (see Input.ContextKey below).
+                  type: string
+                sourceField:
+                  description: SourceField is a dot-path into that step's output,
+                    e.g. "sum"
+                  type: string
+                targetField:
+                  description: TargetField is a dot-path into THIS step's request
+                    body, e.g. "value"
+                  type: string
+              required:
+              - sourceContextKey
+              - sourceField
+              - targetField
+              type: object
+            type: array
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          method:
+            description: Method defaults to POST if empty.
+            type: string
+          requestBody:
+            description: RequestBody is the static/base JSON request body.
+            type: object
+            x-kubernetes-preserve-unknown-fields: true
+        required:
+        - contextKey
+        - endpoint
+        type: object
+    served: true
+    storage: true

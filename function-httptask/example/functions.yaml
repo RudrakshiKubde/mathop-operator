@@ -1,0 +1,9 @@
+apiVersion: pkg.crossplane.io/v1
+kind: Function
+metadata:
+  name: function-httptask
+  annotations:
+    render.crossplane.io/runtime: Development
+    render.crossplane.io/runtime-development-target: "dns:///host.docker.internal:9443"
+spec:
+  package: function-httptask
