@@ -19,10 +19,6 @@ spec:
   - name: ""
     schema:
       openAPIV3Schema:
-        description: |-
-          Input is this Function's per-pipeline-step configuration. The task list
-          itself now lives on the XR's own spec.tasks (see TaskSpec in fn.go) —
-          Input only carries defaults applied to every task unless overridden.
         properties:
           apiVersion:
             description: |-
@@ -34,9 +30,8 @@ spec:
           defaultHeaders:
             additionalProperties:
               type: string
-            description: |-
-              DefaultHeaders are merged into every task's HTTP request, unless a
-              task sets the same header key itself.
+            description: DefaultHeaders are merged into every task's request unless
+              overridden.
             type: object
           kind:
             description: |-
@@ -48,6 +43,11 @@ spec:
             type: string
           metadata:
             type: object
+          providerConfigName:
+            description: |-
+              ProviderConfigName is the provider-http ProviderConfig used for every
+              task's DisposableRequest. Defaults to "default".
+            type: string
         type: object
     served: true
     storage: true

@@ -3,5 +3,5 @@ kind: Function
 metadata:
   name: function-httptask
 spec:
-  package: kind-registry.local:5000/function-httptask:v0.2.0
+  package: kind-registry.local:5000/function-httptask:v0.3.1
   packagePullPolicy: IfNotPresent

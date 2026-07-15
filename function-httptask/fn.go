@@ -1,14 +1,10 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"strings"
-	"time"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
@@ -16,6 +12,8 @@ import (
 	"github.com/crossplane/function-sdk-go/logging"
 	fnv1 "github.com/crossplane/function-sdk-go/proto/v1"
 	"github.com/crossplane/function-sdk-go/request"
+	"github.com/crossplane/function-sdk-go/resource"
+	"github.com/crossplane/function-sdk-go/resource/composed"
 	"github.com/crossplane/function-sdk-go/response"
 
 	"github.com/crossplane/function-httptask/input/v1beta1"
@@ -23,9 +21,7 @@ import (
 
 type Function struct {
 	fnv1.UnimplementedFunctionRunnerServiceServer
-
-	log        logging.Logger
-	httpClient *http.Client
+	log logging.Logger
 }
 
 type TaskSpec struct {
@@ -45,7 +41,7 @@ type FieldMapping struct {
 
 type TaskStatus struct {
 	Name       string                 `json:"name"`
-	Phase      string                 `json:"phase"` // Succeeded, Failed
+	Phase      string                 `json:"phase"` // Pending, Running, Succeeded, Failed, Skipped
 	StatusCode *int32                 `json:"statusCode,omitempty"`
 	Output     map[string]interface{} `json:"output,omitempty"`
 	Error      string                 `json:"error,omitempty"`
@@ -57,11 +53,12 @@ func (f *Function) RunFunction(ctx context.Context, req *fnv1.RunFunctionRequest
 
 	in := &v1beta1.Input{}
 	if err := request.GetInput(req, in); err != nil {
-		response.Fatal(rsp, errors.Wrapf(err, "cannot get Function input from %T", req))
+		response.Fatal(rsp, errors.Wrapf(err, "cannot get Function input"))
 		return rsp, nil
 	}
-	if f.httpClient == nil {
-		f.httpClient = &http.Client{Timeout: 10 * time.Second}
+	providerConfigName := in.ProviderConfigName
+	if providerConfigName == "" {
+		providerConfigName = "default"
 	}
 
 	oxr, err := request.GetObservedCompositeResource(req)
@@ -70,13 +67,10 @@ func (f *Function) RunFunction(ctx context.Context, req *fnv1.RunFunctionRequest
 		return rsp, nil
 	}
 	content := oxr.Resource.UnstructuredContent()
+	uid, _, _ := unstructured.NestedString(content, "metadata", "uid")
 
 	rawTasks, found, err := unstructured.NestedSlice(content, "spec", "tasks")
-	if err != nil {
-		response.Fatal(rsp, errors.Wrapf(err, "cannot read spec.tasks"))
-		return rsp, nil
-	}
-	if !found || len(rawTasks) == 0 {
+	if err != nil || !found || len(rawTasks) == 0 {
 		response.Fatal(rsp, errors.New("spec.tasks must contain at least one task"))
 		return rsp, nil
 	}
@@ -87,29 +81,81 @@ func (f *Function) RunFunction(ctx context.Context, req *fnv1.RunFunctionRequest
 		return rsp, nil
 	}
 
-	uid, _, _ := unstructured.NestedString(content, "metadata", "uid")
-
-	outputs := map[string]map[string]interface{}{}
-	final := make([]TaskStatus, 0, len(tasks))
-	failed := false
-
-	for _, task := range tasks {
-		if failed {
-			final = append(final, TaskStatus{Name: task.Name, Phase: "Skipped"})
-			continue
-		}
-		s := f.execute(ctx, task, outputs, in.DefaultHeaders)
-		if s.Phase == "Failed" {
-			failed = true
-		} else {
-			outputs[task.Name] = s.Output
-		}
-		final = append(final, s)
+	observed, err := request.GetObservedComposedResources(req)
+	if err != nil {
+		response.Fatal(rsp, errors.Wrapf(err, "cannot get observed composed resources"))
+		return rsp, nil
 	}
 
-	phase := "Succeeded"
+	desired := map[resource.Name]*resource.DesiredComposed{}
+	outputs := map[string]map[string]interface{}{}
+	statuses := make([]TaskStatus, 0, len(tasks))
+	failed := false
+	blocked := false // true once we hit a task whose dependency isn't ready yet
+
+	for _, task := range tasks {
+		name := resource.Name(task.Name)
+
+		if failed || blocked {
+			statuses = append(statuses, TaskStatus{Name: task.Name, Phase: "Skipped"})
+			continue
+		}
+
+		obs, exists := observed[name]
+
+		if !exists {
+			// Not created yet. Only create it once every dependency has
+			// already produced an output.
+			if !depsReady(task, outputs) {
+				statuses = append(statuses, TaskStatus{Name: task.Name, Phase: "Pending"})
+				blocked = true
+				continue
+			}
+			dr, err := buildDisposableRequest(task, in.DefaultHeaders, providerConfigName, outputs)
+			if err != nil {
+				statuses = append(statuses, TaskStatus{Name: task.Name, Phase: "Failed", Error: err.Error()})
+				failed = true
+				continue
+			}
+			desired[name] = &resource.DesiredComposed{Resource: dr}
+			statuses = append(statuses, TaskStatus{Name: task.Name, Phase: "Pending"})
+			blocked = true // don't also try to create a later task in this same round
+			continue
+		}
+
+		// Already exists — echo it back unchanged (its forProvider fields
+		// are immutable in provider-http; never re-derive them).
+		dr, err := buildDisposableRequest(task, in.DefaultHeaders, providerConfigName, outputs)
+		if err != nil {
+			statuses = append(statuses, TaskStatus{Name: task.Name, Phase: "Failed", Error: err.Error()})
+			failed = true
+			continue
+		}
+		desired[name] = &resource.DesiredComposed{Resource: dr}
+
+		s := taskStatusFromObserved(task.Name, obs.Resource)
+		if s.Phase == "Succeeded" {
+			outputs[task.Name] = s.Output
+		}
+		if s.Phase == "Failed" {
+			failed = true
+		}
+		if s.Phase == "Running" {
+			blocked = true // don't create later tasks while this one's still in flight
+		}
+		statuses = append(statuses, s)
+	}
+
+	phase := "Running"
 	if failed {
 		phase = "Failed"
+	} else if allDone(statuses) {
+		phase = "Succeeded"
+	}
+
+	if err := response.SetDesiredComposedResources(rsp, desired); err != nil {
+		response.Fatal(rsp, errors.Wrapf(err, "cannot set desired composed resources"))
+		return rsp, nil
 	}
 
 	dxr, err := request.GetDesiredCompositeResource(req)
@@ -120,29 +166,31 @@ func (f *Function) RunFunction(ctx context.Context, req *fnv1.RunFunctionRequest
 	dc := dxr.Resource.UnstructuredContent()
 	_ = unstructured.SetNestedField(dc, uid, "status", "transactionID")
 	_ = unstructured.SetNestedField(dc, phase, "status", "phase")
-	rawFinal, _ := toUnstructuredSlice(final)
+	rawFinal, _ := toUnstructuredSlice(statuses)
 	_ = unstructured.SetNestedSlice(dc, rawFinal, "status", "tasks")
 	if err := response.SetDesiredCompositeResource(rsp, dxr); err != nil {
 		response.Fatal(rsp, errors.Wrapf(err, "cannot set desired composite resource"))
 		return rsp, nil
 	}
 
-	if failed {
-		// NOT Fatal — a task failing is a normal, observable outcome.
-		// Fatal would discard the status.tasks/status.phase we just set.
+	switch phase {
+	case "Failed":
 		response.ConditionFalse(rsp, "FunctionSuccess", "TaskFailed").
-			WithMessage("one or more tasks failed, see status.tasks for details").
-			TargetCompositeAndClaim()
-		return rsp, nil
+			WithMessage("one or more tasks failed, see status.tasks").TargetCompositeAndClaim()
+	case "Running":
+		response.ConditionFalse(rsp, "FunctionSuccess", "Running").
+			WithMessage("workflow still in progress").TargetCompositeAndClaim()
+	default:
+		response.ConditionTrue(rsp, "FunctionSuccess", "Computed").
+			WithMessage(fmt.Sprintf("ran %d task(s) successfully", len(tasks))).TargetCompositeAndClaim()
 	}
-
-	response.ConditionTrue(rsp, "FunctionSuccess", "Computed").
-		WithMessage(fmt.Sprintf("ran %d task(s) successfully", len(tasks))).
-		TargetCompositeAndClaim()
 	return rsp, nil
 }
 
-func (f *Function) execute(ctx context.Context, task TaskSpec, outputs map[string]map[string]interface{}, defaultHeaders map[string]string) TaskStatus {
+// buildDisposableRequest constructs the desired DisposableRequest for a task
+// that hasn't been created yet, resolving inputFrom against already-captured
+// outputs of earlier tasks.
+func buildDisposableRequest(task TaskSpec, defaultHeaders map[string]string, providerConfigName string, outputs map[string]map[string]interface{}) (*composed.Unstructured, error) {
 	body := map[string]interface{}{}
 	for k, v := range task.Input {
 		body[k] = v
@@ -150,62 +198,99 @@ func (f *Function) execute(ctx context.Context, task TaskSpec, outputs map[strin
 	for _, m := range task.InputFrom {
 		src, ok := outputs[m.SourceTask]
 		if !ok {
-			return TaskStatus{Name: task.Name, Phase: "Failed",
-				Error: fmt.Sprintf("task %q has not completed yet (referenced by %q)", m.SourceTask, task.Name)}
+			return nil, fmt.Errorf("task %q has not completed yet (referenced by %q)", m.SourceTask, task.Name)
 		}
 		val, ok := getJSONField(src, m.SourceField)
 		if !ok {
-			return TaskStatus{Name: task.Name, Phase: "Failed",
-				Error: fmt.Sprintf("field %q not present in task %q's output", m.SourceField, m.SourceTask)}
+			return nil, fmt.Errorf("field %q not present in task %q's output", m.SourceField, m.SourceTask)
 		}
 		setJSONField(body, m.TargetField, val)
 	}
-
 	bodyBytes, err := json.Marshal(body)
 	if err != nil {
-		return TaskStatus{Name: task.Name, Phase: "Failed", Error: err.Error()}
+		return nil, err
 	}
+
 	method := task.Method
 	if method == "" {
-		method = http.MethodPost
+		method = "POST"
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, method, task.Endpoint, bytes.NewReader(bodyBytes))
-	if err != nil {
-		return TaskStatus{Name: task.Name, Phase: "Failed", Error: err.Error()}
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
+	headers := map[string][]string{"Content-Type": {"application/json"}}
 	for k, v := range defaultHeaders {
-		httpReq.Header.Set(k, v)
+		headers[k] = []string{v}
 	}
 	for k, v := range task.Headers {
-		httpReq.Header.Set(k, v)
+		headers[k] = []string{v}
 	}
 
-	httpRsp, err := f.httpClient.Do(httpReq)
-	if err != nil {
-		return TaskStatus{Name: task.Name, Phase: "Failed",
-			Error: fmt.Sprintf("HTTP call to %s failed: %v", task.Endpoint, err)}
+	dr := composed.New()
+	dr.SetAPIVersion("http.crossplane.io/v1alpha2")
+	dr.SetKind("DisposableRequest")
+	_ = dr.SetValue("spec.providerConfigRef.name", providerConfigName)
+	_ = dr.SetValue("spec.forProvider.url", task.Endpoint)
+	_ = dr.SetValue("spec.forProvider.method", method)
+	_ = dr.SetValue("spec.forProvider.body", string(bodyBytes))
+	headersIface := map[string]interface{}{}
+	for k, v := range headers {
+		vals := make([]interface{}, len(v))
+		for i, s := range v {
+			vals[i] = s
+		}
+		headersIface[k] = vals
 	}
-	defer httpRsp.Body.Close()
-	respBytes, err := io.ReadAll(httpRsp.Body)
-	if err != nil {
-		return TaskStatus{Name: task.Name, Phase: "Failed", Error: err.Error()}
+	_ = dr.SetValue("spec.forProvider.headers", headersIface)
+	return dr, nil
+}
+
+// taskStatusFromObserved reads an already-created DisposableRequest's status
+// and translates it into our TaskStatus shape.
+func taskStatusFromObserved(name string, res *composed.Unstructured) TaskStatus {
+	errMsg, _ := res.GetString("status.error")
+	if errMsg != "" {
+		return TaskStatus{Name: name, Phase: "Failed", Error: errMsg}
 	}
 
-	code := int32(httpRsp.StatusCode)
-	if httpRsp.StatusCode < 200 || httpRsp.StatusCode >= 300 {
-		return TaskStatus{Name: task.Name, Phase: "Failed", StatusCode: &code,
-			Error: fmt.Sprintf("%s returned HTTP %d: %s", task.Endpoint, httpRsp.StatusCode, string(respBytes))}
+	code, _ := res.GetInteger("status.response.statusCode")
+	bodyStr, _ := res.GetString("status.response.body")
+	synced, _ := res.GetValue("status.synced")
+
+	if code == 0 && bodyStr == "" {
+		return TaskStatus{Name: name, Phase: "Running"}
 	}
 
-	var outputMap map[string]interface{}
-	if err := json.Unmarshal(respBytes, &outputMap); err != nil {
-		return TaskStatus{Name: task.Name, Phase: "Failed", StatusCode: &code,
-			Error: fmt.Sprintf("response from %s is not a JSON object", task.Endpoint)}
+	c := int32(code)
+	if code < 200 || code >= 300 {
+		return TaskStatus{Name: name, Phase: "Failed", StatusCode: &c,
+			Error: fmt.Sprintf("endpoint returned HTTP %d: %s", code, bodyStr)}
+	}
+	if syncedBool, ok := synced.(bool); ok && !syncedBool {
+		return TaskStatus{Name: name, Phase: "Running", StatusCode: &c}
 	}
 
-	f.log.Info("called endpoint", "task", task.Name, "endpoint", task.Endpoint, "statusCode", httpRsp.StatusCode)
-	return TaskStatus{Name: task.Name, Phase: "Succeeded", StatusCode: &code, Output: outputMap}
+	var out map[string]interface{}
+	if err := json.Unmarshal([]byte(bodyStr), &out); err != nil {
+		return TaskStatus{Name: name, Phase: "Failed", StatusCode: &c,
+			Error: "response body is not a JSON object"}
+	}
+	return TaskStatus{Name: name, Phase: "Succeeded", StatusCode: &c, Output: out}
+}
+
+func depsReady(task TaskSpec, outputs map[string]map[string]interface{}) bool {
+	for _, m := range task.InputFrom {
+		if _, ok := outputs[m.SourceTask]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func allDone(statuses []TaskStatus) bool {
+	for _, s := range statuses {
+		if s.Phase != "Succeeded" {
+			return false
+		}
+	}
+	return len(statuses) > 0
 }
 
 func toUnstructuredSlice(v interface{}) ([]interface{}, error) {
@@ -214,10 +299,8 @@ func toUnstructuredSlice(v interface{}) ([]interface{}, error) {
 		return nil, err
 	}
 	var out []interface{}
-	if err := json.Unmarshal(b, &out); err != nil {
-		return nil, err
-	}
-	return out, nil
+	err = json.Unmarshal(b, &out)
+	return out, err
 }
 
 func getJSONField(data map[string]interface{}, path string) (interface{}, bool) {

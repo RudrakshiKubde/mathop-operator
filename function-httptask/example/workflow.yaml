@@ -3,6 +3,7 @@ kind: Workflow
 metadata:
   name: example-xr
 spec:
+  notifyURL: https://webhook.site/dba616f8-4834-4d2b-a7a6-85a23a830fda
   tasks:
   - name: add
     endpoint: http://mock-server.default.svc.cluster.local:9090/add
