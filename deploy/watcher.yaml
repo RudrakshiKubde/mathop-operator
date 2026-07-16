@@ -1,0 +1,48 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: workflow-watcher
+  namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: workflow-watcher
+rules:
+- apiGroups: ["example.crossplane.io"]
+  resources: ["workflows"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: workflow-watcher
+subjects:
+- kind: ServiceAccount
+  name: workflow-watcher
+  namespace: default
+roleRef:
+  kind: ClusterRole
+  name: workflow-watcher
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: workflow-watcher
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: workflow-watcher}
+  template:
+    metadata:
+      labels: {app: workflow-watcher}
+    spec:
+      serviceAccountName: workflow-watcher
+      containers:
+      - name: watcher
+        image: kind-registry.local:5000/workflow-watcher:v0.2.0
+        envFrom:
+        - secretRef:
+            name: workflow-watcher-db

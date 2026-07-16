@@ -4,12 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"log"
-	"net/http"
 	"os"
 	"strings"
-	"time"
-
-	"bytes"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -71,6 +67,11 @@ func main() {
 	select {}
 }
 
+// handleWorkflow persists a Workflow's current progress to Postgres.
+// It does NOT fire the completion webhook — that's now handled by
+// provider-http via the synthetic "notify" DisposableRequest that fn.go
+// creates once the workflow settles, so this stays purely a data-recording
+// concern (no risk of double-firing the webhook from two places).
 func handleWorkflow(ctx context.Context, pool *pgxpool.Pool, u *unstructured.Unstructured) error {
 	name := u.GetName()
 	txID, _, _ := unstructured.NestedString(u.Object, "status", "transactionID")
@@ -93,56 +94,8 @@ func handleWorkflow(ctx context.Context, pool *pgxpool.Pool, u *unstructured.Uns
 			return err
 		}
 	}
-
-	if phase != "Succeeded" && phase != "Failed" {
-		return nil
-	}
-	notified, err := isNotified(ctx, pool, txID)
-	if err != nil {
-		return err
-	}
-	if notified || notifyURL == "" {
-		return nil
-	}
-
-	if err := sendWebhook(ctx, notifyURL, name, txID, phase, rawTasks); err != nil {
-		log.Printf("webhook delivery failed for %s (%s): %v — will retry next reconcile", name, txID, err)
-		return nil // leave notified=false, retry on next observed change
-	}
-	return markNotified(ctx, pool, txID)
-}
-
-func sendWebhook(ctx context.Context, url, name, txID, phase string, tasks []interface{}) error {
-	payload, err := json.Marshal(map[string]interface{}{
-		"workflow":      name,
-		"transactionID": txID,
-		"phase":         phase,
-		"tasks":         tasks,
-	})
-	if err != nil {
-		return err
-	}
-	reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, url, bytes.NewReader(payload))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		return &webhookError{resp.StatusCode}
-	}
 	return nil
 }
-
-type webhookError struct{ code int }
-
-func (e *webhookError) Error() string { return "webhook endpoint returned non-2xx status" }
 
 func buildDynamicClient() (dynamic.Interface, error) {
 	cfg, err := rest.InClusterConfig()
@@ -174,7 +127,6 @@ CREATE TABLE IF NOT EXISTS workflow_runs (
     workflow_name  TEXT NOT NULL,
     notify_url     TEXT,
     phase          TEXT NOT NULL,
-    notified       BOOLEAN NOT NULL DEFAULT FALSE,
     created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -225,23 +177,13 @@ SET phase = EXCLUDED.phase, status_code = EXCLUDED.status_code,
 	return err
 }
 
-func isNotified(ctx context.Context, pool *pgxpool.Pool, txID string) (bool, error) {
-	var notified bool
-	err := pool.QueryRow(ctx, `SELECT notified FROM workflow_runs WHERE transaction_id = $1`, txID).Scan(&notified)
-	return notified, err
-}
-
-func markNotified(ctx context.Context, pool *pgxpool.Pool, txID string) error {
-	_, err := pool.Exec(ctx, `UPDATE workflow_runs SET notified = TRUE WHERE transaction_id = $1`, txID)
-	return err
-}
-
 func nullIfEmpty(s string) interface{} {
 	if strings.TrimSpace(s) == "" {
 		return nil
 	}
 	return s
 }
+
 func nullIfEmptyBytes(b []byte) interface{} {
 	if len(b) == 0 {
 		return nil

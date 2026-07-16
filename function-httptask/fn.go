@@ -111,6 +111,7 @@ func (f *Function) RunFunction(ctx context.Context, req *fnv1.RunFunctionRequest
 				blocked = true
 				continue
 			}
+			// Create a new DisposableRequest for this task, using the outputs of earlier tasks to fill in any inputFrom fields.
 			dr, err := buildDisposableRequest(task, in.DefaultHeaders, providerConfigName, outputs)
 			if err != nil {
 				statuses = append(statuses, TaskStatus{Name: task.Name, Phase: "Failed", Error: err.Error()})
@@ -152,6 +153,22 @@ func (f *Function) RunFunction(ctx context.Context, req *fnv1.RunFunctionRequest
 	} else if allDone(statuses) {
 		phase = "Succeeded"
 	}
+
+
+	const notifyKey = resource.Name("__notify__")
+	if phase == "Succeeded" || phase == "Failed" {
+		notifyURL, _, _ := unstructured.NestedString(content, "spec", "notifyURL")
+		workflowName, _, _ := unstructured.NestedString(content, "metadata", "name")
+		if notifyURL != "" {
+			nr, err := buildNotifyRequest(workflowName, uid, phase, statuses, notifyURL, providerConfigName)
+			if err != nil {
+				f.log.Info("cannot build notify request", "error", err.Error())
+			} else {
+				desired[notifyKey] = &resource.DesiredComposed{Resource: nr}
+			}
+		}
+	}
+
 
 	if err := response.SetDesiredComposedResources(rsp, desired); err != nil {
 		response.Fatal(rsp, errors.Wrapf(err, "cannot set desired composed resources"))
@@ -242,8 +259,33 @@ func buildDisposableRequest(task TaskSpec, defaultHeaders map[string]string, pro
 	return dr, nil
 }
 
+
+func buildNotifyRequest(workflowName, txID, phase string, tasks []TaskStatus, notifyURL, providerConfigName string) (*composed.Unstructured, error) {
+	payload, err := json.Marshal(map[string]interface{}{
+		"workflow":      workflowName,
+		"transactionID": txID,
+		"phase":         phase,
+		"tasks":         tasks,
+	})
+	if err != nil {
+		return nil, err
+	}
+	nr := composed.New()
+	nr.SetAPIVersion("http.crossplane.io/v1alpha2")
+	nr.SetKind("DisposableRequest")
+	_ = nr.SetValue("spec.providerConfigRef.name", providerConfigName)
+	_ = nr.SetValue("spec.forProvider.url", notifyURL)
+	_ = nr.SetValue("spec.forProvider.method", "POST")
+	_ = nr.SetValue("spec.forProvider.body", string(payload))
+	_ = nr.SetValue("spec.forProvider.headers", map[string]interface{}{
+		"Content-Type": []interface{}{"application/json"},
+	})
+	return nr, nil
+}
 // taskStatusFromObserved reads an already-created DisposableRequest's status
 // and translates it into our TaskStatus shape.
+
+
 func taskStatusFromObserved(name string, res *composed.Unstructured) TaskStatus {
 	errMsg, _ := res.GetString("status.error")
 	if errMsg != "" {

@@ -1,12 +1,13 @@
 apiVersion: apiextensions.crossplane.io/v1
 kind: CompositeResourceDefinition
 metadata:
-  name: xrs.example.crossplane.io
+  name: workflows.example.crossplane.io
 spec:
   group: example.crossplane.io
   names:
     kind: Workflow
     plural: workflows
+
   versions:
   - name: v1
     served: true
@@ -18,6 +19,7 @@ spec:
           spec:
             type: object
             required: [tasks]
+            x-kubernetes-preserve-unknown-fields: true
             properties:
               tasks:
                 type: array
@@ -44,10 +46,14 @@ spec:
                           sourceTask: {type: string}
                           sourceField: {type: string}
                           targetField: {type: string}
+              notifyURL:
+                type: string
+
           status:
             type: object
             properties:
               phase: {type: string}
+              transactionID: {type: string}
               tasks:
                 type: array
                 items:

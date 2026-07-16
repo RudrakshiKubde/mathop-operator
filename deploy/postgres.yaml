@@ -1,0 +1,46 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: workflow-db
+  namespace: default
+stringData:
+  POSTGRES_PASSWORD: changeme
+  POSTGRES_DB: workflows
+  POSTGRES_USER: workflows
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: workflow-postgres
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: workflow-postgres}
+  template:
+    metadata:
+      labels: {app: workflow-postgres}
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:16
+        envFrom:
+        - secretRef: {name: workflow-db}
+        ports:
+        - containerPort: 5432
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/postgresql/data
+      volumes:
+      - name: data
+        emptyDir: {}   # swap for a real PersistentVolumeClaim in production
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: workflow-postgres
+  namespace: default
+spec:
+  selector: {app: workflow-postgres}
+  ports:
+  - port: 5432
