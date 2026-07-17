@@ -89,14 +89,24 @@ func (f *Function) RunFunction(ctx context.Context, req *fnv1.RunFunctionRequest
 
 	desired := map[resource.Name]*resource.DesiredComposed{}
 	outputs := map[string]map[string]interface{}{}
+	failedTasks := map[string]bool{}
+	overallFailed := false
 	statuses := make([]TaskStatus, 0, len(tasks))
-	failed := false
-	blocked := false // true once we hit a task whose dependency isn't ready yet
 
 	for _, task := range tasks {
 		name := resource.Name(task.Name)
 
-		if failed || blocked {
+		// If any of THIS task's own dependencies has failed, it can never
+		// run — skip it permanently. This does NOT block unrelated tasks
+		// with no dependency on the failed one.
+		depFailed := false
+		for _, m := range task.InputFrom {
+			if failedTasks[m.SourceTask] {
+				depFailed = true
+				break
+			}
+		}
+		if depFailed {
 			statuses = append(statuses, TaskStatus{Name: task.Name, Phase: "Skipped"})
 			continue
 		}
@@ -104,56 +114,49 @@ func (f *Function) RunFunction(ctx context.Context, req *fnv1.RunFunctionRequest
 		obs, exists := observed[name]
 
 		if !exists {
-			// Not created yet. Only create it once every dependency has
-			// already produced an output.
 			if !depsReady(task, outputs) {
 				statuses = append(statuses, TaskStatus{Name: task.Name, Phase: "Pending"})
-				blocked = true
-				continue
+				continue // NOT blocked — just this task waits; move on to the next
 			}
-			// Create a new DisposableRequest for this task, using the outputs of earlier tasks to fill in any inputFrom fields.
 			dr, err := buildDisposableRequest(task, in.DefaultHeaders, providerConfigName, outputs)
 			if err != nil {
 				statuses = append(statuses, TaskStatus{Name: task.Name, Phase: "Failed", Error: err.Error()})
-				failed = true
+				failedTasks[task.Name] = true
+				overallFailed = true
 				continue
 			}
 			desired[name] = &resource.DesiredComposed{Resource: dr}
 			statuses = append(statuses, TaskStatus{Name: task.Name, Phase: "Pending"})
-			blocked = true // don't also try to create a later task in this same round
 			continue
 		}
 
-		// Already exists — echo it back unchanged (its forProvider fields
-		// are immutable in provider-http; never re-derive them).
-		dr, err := buildDisposableRequest(task, in.DefaultHeaders, providerConfigName, outputs)
-		if err != nil {
-			statuses = append(statuses, TaskStatus{Name: task.Name, Phase: "Failed", Error: err.Error()})
-			failed = true
-			continue
-		}
-		desired[name] = &resource.DesiredComposed{Resource: dr}
-
-		s := taskStatusFromObserved(task.Name, obs.Resource)
-		if s.Phase == "Succeeded" {
-			outputs[task.Name] = s.Output
-		}
-		if s.Phase == "Failed" {
-			failed = true
-		}
-		if s.Phase == "Running" {
-			blocked = true // don't create later tasks while this one's still in flight
-		}
-		statuses = append(statuses, s)
+	// Already exists — rebuild deterministically (never echo obs.Resource).
+	dr, err := buildDisposableRequest(task, in.DefaultHeaders, providerConfigName, outputs)
+	if err != nil {
+		statuses = append(statuses, TaskStatus{Name: task.Name, Phase: "Failed", Error: err.Error()})
+		failedTasks[task.Name] = true
+		overallFailed = true
+		continue
 	}
+	desired[name] = &resource.DesiredComposed{Resource: dr}
+
+	s := taskStatusFromObserved(task.Name, obs.Resource)
+	if s.Phase == "Succeeded" {
+		outputs[task.Name] = s.Output
+	}
+	if s.Phase == "Failed" {
+		failedTasks[task.Name] = true
+		overallFailed = true
+	}
+	statuses = append(statuses, s)
+}
 
 	phase := "Running"
-	if failed {
+	if overallFailed {
 		phase = "Failed"
 	} else if allDone(statuses) {
 		phase = "Succeeded"
 	}
-
 
 	const notifyKey = resource.Name("__notify__")
 	if phase == "Succeeded" || phase == "Failed" {
@@ -259,7 +262,7 @@ func buildDisposableRequest(task TaskSpec, defaultHeaders map[string]string, pro
 	return dr, nil
 }
 
-
+// creates a DisposableRequest for the provider-http to call the workflow's notifyURL once the workflow has settled (succeeded or failed). This is done via a synthetic "notify" task that is only created once the workflow has completed, so that we don't risk double-firing the webhook from two places.
 func buildNotifyRequest(workflowName, txID, phase string, tasks []TaskStatus, notifyURL, providerConfigName string) (*composed.Unstructured, error) {
 	payload, err := json.Marshal(map[string]interface{}{
 		"workflow":      workflowName,
@@ -270,8 +273,10 @@ func buildNotifyRequest(workflowName, txID, phase string, tasks []TaskStatus, no
 	if err != nil {
 		return nil, err
 	}
+	//creates new composed resource
 	nr := composed.New()
 	nr.SetAPIVersion("http.crossplane.io/v1alpha2")
+	//sets the resource kind to DisposableRequest, which is a resource type that provider-http understands and can use to make HTTP requests.
 	nr.SetKind("DisposableRequest")
 	_ = nr.SetValue("spec.providerConfigRef.name", providerConfigName)
 	_ = nr.SetValue("spec.forProvider.url", notifyURL)
@@ -282,10 +287,10 @@ func buildNotifyRequest(workflowName, txID, phase string, tasks []TaskStatus, no
 	})
 	return nr, nil
 }
+
+
 // taskStatusFromObserved reads an already-created DisposableRequest's status
-// and translates it into our TaskStatus shape.
-
-
+// and translates it into our TaskStatus shape
 func taskStatusFromObserved(name string, res *composed.Unstructured) TaskStatus {
 	errMsg, _ := res.GetString("status.error")
 	if errMsg != "" {
